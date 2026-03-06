@@ -53,6 +53,9 @@ CFLAGS ?= $(BASE_CFLAGS) $(ARCH_CFLAGS)
 CFLAGS_DEBUG = -Wall -Wextra -g -O0 -fsanitize=address -fsanitize=undefined \
                -fno-omit-frame-pointer -fPIC
 
+VALGRIND ?= valgrind
+VALGRIND_FLAGS ?= --leak-check=full --show-leak-kinds=all --track-origins=yes --errors-for-leak-kinds=definite,possible --error-exitcode=1
+
 # Platform-specific linker flags
 ifeq ($(UNAME_S),Linux)
     # Linux: Full RELRO for GOT protection
@@ -88,7 +91,7 @@ else
 endif
 
 # Targets
-.PHONY: all static shared clean test test-native test-debug install
+.PHONY: all static shared clean test test-native test-debug valgrind safety install
 
 all: static shared
 
@@ -167,3 +170,10 @@ uninstall:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+valgrind: $(TEST_BIN)
+	@echo "Running core tests under valgrind..."
+	@$(VALGRIND) $(VALGRIND_FLAGS) ./$(TEST_BIN)
+
+safety: test-debug valgrind
+	@echo "Safety checks completed"
