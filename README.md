@@ -4,7 +4,7 @@
 
 Core C library for CISV with SIMD optimizations (AVX-512/AVX2 + scalar fallback).
 
-## Features
+## FEATURES
 
 - SIMD-accelerated CSV parsing
 - Streaming parser and iterator API
@@ -12,7 +12,7 @@ Core C library for CISV with SIMD optimizations (AVX-512/AVX2 + scalar fallback)
 - Configurable delimiter, quote, escape, comments, trimming
 - Transform hooks and parallel chunk support
 
-## Performance
+## PERFORMANCE
 
 Typical throughput (machine dependent):
 
@@ -22,7 +22,7 @@ Typical throughput (machine dependent):
 | Quoted fields | 175-189 MB/s |
 | Large fields | 153-169 MB/s |
 
-## Installation
+## INSTALLATION
 
 ```bash
 git clone https://github.com/Sanix-Darker/cisv-core
@@ -32,7 +32,7 @@ make -C core all
 
 ## C API
 
-### Basic example
+### BASIC EXAMPLE
 
 ```c
 cisv_config cfg;
@@ -42,7 +42,7 @@ cisv_parser_parse_file(p, "data.csv");
 cisv_parser_destroy(p);
 ```
 
-### Detailed example (iterator + early exit)
+### DETAILED EXAMPLE (ITERATOR + EARLY EXIT)
 
 ```c
 cisv_config cfg;
@@ -59,14 +59,14 @@ cisv_iterator_close(it);
 
 More runnable examples: [`examples/`](./examples)
 
-## Benchmarks
+## BENCHMARKS
 
 ```bash
 docker build -t cisv-core-bench -f core/benchmarks/Dockerfile .
 # or run workflow: .github/workflows/benchmark.yml
 ```
 
-## Repository Map
+## REPOSITORY MAP
 
 - Core: https://github.com/Sanix-Darker/cisv-core
 - CLI: https://github.com/Sanix-Darker/cisv-cli
