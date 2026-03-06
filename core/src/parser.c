@@ -246,6 +246,8 @@ static inline bool ensure_quote_buffer(cisv_parser *p, size_t needed) {
     // Enforce maximum buffer size to prevent DoS
     if (new_size > MAX_QUOTE_BUFFER_SIZE) return false;
 
+    // cppcheck-suppress memleak
+    // realloc ownership is transferred to tmp; on failure old pointer stays in p->quote_buffer.
     void *tmp = realloc(p->quote_buffer, new_size);
     if (__builtin_expect(!tmp, 0)) return false;
     p->quote_buffer = tmp;
@@ -285,6 +287,8 @@ static inline bool ensure_stream_buffer(cisv_parser *p, size_t needed) {
         return false;
     }
 
+    // cppcheck-suppress memleak
+    // realloc ownership is transferred to tmp; on failure old pointer stays in p->stream_buffer.
     void *tmp = realloc(p->stream_buffer, new_size);
     if (!tmp) {
         // SECURITY: On realloc failure, old buffer is still valid
