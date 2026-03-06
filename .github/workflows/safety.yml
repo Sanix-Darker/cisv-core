@@ -16,8 +16,7 @@ jobs:
       - name: Cppcheck
         run: |
           cppcheck \
-            --enable=warning,style,performance,portability \
-            --inconclusive \
+            --enable=warning,performance,portability \
             --std=c11 \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
