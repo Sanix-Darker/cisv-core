@@ -17,12 +17,12 @@ jobs:
       - name: Smoke benchmark
         run: |
           python3 - <<'PY'
-import csv
-with open('bench.csv','w',newline='') as f:
-    w=csv.writer(f)
-    w.writerow(['id','name'])
-    for i in range(200000):
-        w.writerow([i,f'name_{i}'])
-PY
+          import csv
+          with open('bench.csv', 'w', newline='') as f:
+              w = csv.writer(f)
+              w.writerow(['id', 'name'])
+              for i in range(200000):
+                  w.writerow([i, f'name_{i}'])
+          PY
           # core repo intentionally benchmarks via downstream repos/CLI.
           ls -lh bench.csv
