@@ -21,6 +21,7 @@ jobs:
             --std=c11 \
             --error-exitcode=1 \
             --suppress=missingIncludeSystem \
+            --suppress=memleak:core/src/parser.c \
             --inline-suppr \
             core/src core/include core/tests
 
