@@ -114,7 +114,7 @@ else
 endif
 
 # Targets
-.PHONY: all static shared clean test test-native test-debug valgrind safety install
+.PHONY: all static shared clean test test-native test-debug valgrind safety install bench-core
 
 all: static shared
 
@@ -148,6 +148,8 @@ $(BUILD_DIR)/%.debug.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 # Tests
 TEST_SRCS = $(TEST_DIR)/test_core.c
 TEST_BIN = $(BUILD_DIR)/test_core
+BENCH_SRC = $(TEST_DIR)/bench_core.c
+BENCH_BIN = $(BUILD_DIR)/bench_core
 
 test: $(TEST_BIN)
 	@echo "Running core tests..."
@@ -155,6 +157,11 @@ test: $(TEST_BIN)
 
 $(TEST_BIN): $(TEST_SRCS) $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $(TEST_SRCS) $(STATIC_LIB) -lm -lpthread
+
+bench-core: $(BENCH_BIN)
+
+$(BENCH_BIN): $(BENCH_SRC) $(STATIC_LIB)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $(BENCH_SRC) $(STATIC_LIB) -lm -lpthread
 
 # Native tests (tests/test_native.c)
 NATIVE_TEST_SRC = ../tests/test_native.c
