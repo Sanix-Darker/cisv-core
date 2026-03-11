@@ -40,7 +40,7 @@
     #define cisv_CTZ(x) __builtin_ctz(x)
 
 // ARM NEON support
-#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
     #include <arm_neon.h>
     #define HAS_NEON
     // NEON doesn't use the same macro pattern, handled separately

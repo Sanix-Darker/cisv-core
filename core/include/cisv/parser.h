@@ -179,7 +179,7 @@ void cisv_results_free(cisv_result_t **results, int count);
 #endif
 
 // ARM NEON support detection
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
     #include <arm_neon.h>
     #define HAS_NEON 1
 #endif

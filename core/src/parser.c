@@ -128,7 +128,7 @@ static inline uint64_t swar_has_special(uint64_t word, char delim, char quote) {
 #ifdef __AVX2__
 // Skip leading whitespace using AVX2 - processes 32 bytes at a time
 // PERF: __restrict hints allow better optimization by promising no aliasing
-static inline const uint8_t * __restrict skip_ws_avx2(
+static inline const uint8_t *skip_ws_avx2(
     const uint8_t * __restrict start,
     const uint8_t * __restrict end
 ) {
@@ -168,7 +168,7 @@ static inline const uint8_t * __restrict skip_ws_avx2(
 
 // Find last non-whitespace using AVX2 - scans backwards
 // PERF: __restrict hints allow better optimization by promising no aliasing
-static inline const uint8_t * __restrict rskip_ws_avx2(
+static inline const uint8_t *rskip_ws_avx2(
     const uint8_t * __restrict start,
     const uint8_t * __restrict end
 ) {
