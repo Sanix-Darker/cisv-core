@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.14)
 project(cisv C CXX)
 
+include(CheckCCompilerFlag)
+
 # =============================================================================
 # Profile-Guided Optimization (PGO) Support
 # Usage:
@@ -30,12 +32,58 @@ set(CISV_SOURCES
     src/transformer.c
 )
 
+set(CISV_COMMON_COMPILE_OPTIONS
+    -O3
+    -pipe
+    -fomit-frame-pointer
+    -Wall
+    -Wextra
+    -ffast-math
+    -funroll-loops
+    -fPIC
+    -fstack-protector-strong
+    -D_FORTIFY_SOURCE=2
+)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    list(APPEND CISV_COMMON_COMPILE_OPTIONS -fstack-check)
+endif()
+
+set(CISV_ARCH_COMPILE_OPTIONS)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    check_c_compiler_flag("-march=native" CISV_HAS_MARCH_NATIVE)
+    if(CISV_HAS_MARCH_NATIVE)
+        list(APPEND CISV_ARCH_COMPILE_OPTIONS -march=native)
+    endif()
+    check_c_compiler_flag("-mavx2" CISV_HAS_MAVX2)
+    if(CISV_HAS_MAVX2)
+        list(APPEND CISV_ARCH_COMPILE_OPTIONS -mavx2)
+    endif()
+    check_c_compiler_flag("-mtune=native" CISV_HAS_MTUNE_NATIVE)
+    if(CISV_HAS_MTUNE_NATIVE)
+        list(APPEND CISV_ARCH_COMPILE_OPTIONS -mtune=native)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+    if(NOT APPLE)
+        check_c_compiler_flag("-mcpu=native" CISV_HAS_MCPU_NATIVE)
+        if(CISV_HAS_MCPU_NATIVE)
+            list(APPEND CISV_ARCH_COMPILE_OPTIONS -mcpu=native)
+        else()
+            check_c_compiler_flag("-march=native" CISV_HAS_ARM_MARCH_NATIVE)
+            if(CISV_HAS_ARM_MARCH_NATIVE)
+                list(APPEND CISV_ARCH_COMPILE_OPTIONS -march=native)
+            endif()
+        endif()
+    endif()
+endif()
+
 # Static library
 add_library(cisv_static STATIC ${CISV_SOURCES})
 target_include_directories(cisv_static PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_compile_options(cisv_static PRIVATE ${CISV_COMMON_COMPILE_OPTIONS} ${CISV_ARCH_COMPILE_OPTIONS})
 set_target_properties(cisv_static PROPERTIES OUTPUT_NAME cisv)
 
 # Shared library
@@ -44,6 +92,7 @@ target_include_directories(cisv_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_compile_options(cisv_shared PRIVATE ${CISV_COMMON_COMPILE_OPTIONS} ${CISV_ARCH_COMPILE_OPTIONS})
 set_target_properties(cisv_shared PROPERTIES OUTPUT_NAME cisv)
 
 # Link pthread for parallel parsing support

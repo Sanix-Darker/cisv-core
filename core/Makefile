@@ -1,10 +1,13 @@
 # CISV Core Library Makefile
 CC ?= gcc
 AR ?= ar
+RANLIB ?= ranlib
 
 # Platform and architecture detection
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
+CC_VERSION := $(shell $(CC) --version 2>/dev/null | head -n 1)
+CC_IS_CLANG := $(findstring clang,$(CC_VERSION))
 
 # PORTABLE mode: Set PORTABLE=1 to build portable binaries without -march=native
 # Example: make PORTABLE=1 shared
@@ -17,7 +20,7 @@ PORTABLE ?= 0
 SECURITY_CFLAGS = -fstack-protector-strong -D_FORTIFY_SOURCE=2
 
 # Base CFLAGS (architecture-independent)
-BASE_CFLAGS = -O3 -pipe -fomit-frame-pointer -Wall -Wextra -std=c11 -flto \
+BASE_CFLAGS = -O3 -pipe -fomit-frame-pointer -Wall -Wextra -std=c11 \
               -ffast-math -funroll-loops -fPIC $(SECURITY_CFLAGS)
 
 # Architecture-specific SIMD flags
@@ -41,7 +44,13 @@ else
     else ifeq ($(UNAME_M),amd64)
         ARCH_CFLAGS = -march=native -mavx2 -mtune=native
     else ifeq ($(UNAME_M),arm64)
-        ARCH_CFLAGS = -mcpu=native
+        ifeq ($(UNAME_S),Darwin)
+            # Apple Clang rejects -mcpu=native on macOS arm64. The target triple
+            # already selects Apple Silicon, so avoid adding an unsupported flag.
+            ARCH_CFLAGS =
+        else
+            ARCH_CFLAGS = -mcpu=native
+        endif
     else ifeq ($(UNAME_M),aarch64)
         ARCH_CFLAGS = -march=native
     else
@@ -69,7 +78,21 @@ else
     SECURITY_LDFLAGS =
 endif
 
-LDFLAGS ?= -flto $(SECURITY_LDFLAGS)
+LTO_CFLAGS =
+LTO_LDFLAGS =
+
+ifneq ($(CC_IS_CLANG),)
+    # Clang + plain ar is fragile with LTO archives across platforms. Keep the
+    # default build linkable unless the toolchain is wired for LLVM binutils.
+    LTO_CFLAGS =
+    LTO_LDFLAGS =
+else
+    LTO_CFLAGS = -flto
+    LTO_LDFLAGS = -flto
+endif
+
+CFLAGS += $(LTO_CFLAGS)
+LDFLAGS ?= $(LTO_LDFLAGS) $(SECURITY_LDFLAGS)
 
 # Directories
 SRC_DIR = src
@@ -103,6 +126,7 @@ static: $(STATIC_LIB)
 
 $(STATIC_LIB): $(OBJS) | $(BUILD_DIR)
 	$(AR) rcs $@ $^
+	$(RANLIB) $@
 
 # Shared library
 shared: $(SHARED_LIB)
