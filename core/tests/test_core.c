@@ -217,6 +217,76 @@ void test_parse_quoted(void) {
     }
 }
 
+void test_parse_quote_inside_unquoted_field(void) {
+    TEST("literal quote inside unquoted field");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) {
+        FAIL("failed to create parser");
+        return;
+    }
+
+    const char *csv = "a\"b\",c\n";
+    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (field_count == 2 && row_count == 1 &&
+        strcmp(stored_fields[0], "a\"b\"") == 0 &&
+        strcmp(stored_fields[1], "c") == 0) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected [a\\\"b\\\", c], got fields=%d rows=%d", field_count, row_count);
+        FAIL(buf);
+    }
+}
+
+void test_parse_backslash_escaped_json(void) {
+    TEST("backslash escaped multiline JSON");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) {
+        FAIL("failed to create parser");
+        return;
+    }
+
+    const char *csv =
+        "id,payload\n"
+        "1,\"{\\\n"
+        "  \\\"name\\\": \\\"alice\\\",\\\n"
+        "  \\\"nested\\\": {\\\"ok\\\": true}\\\n"
+        "}\"" "\n";
+
+    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (field_count == 4 && row_count == 2 &&
+        strcmp(stored_fields[2], "1") == 0 &&
+        strcmp(stored_fields[3], "{\n  \"name\": \"alice\",\n  \"nested\": {\"ok\": true}\n}") == 0) {
+        PASS();
+    } else {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "unexpected escaped JSON parse result: fields=%d rows=%d payload='%s'",
+                 field_count, row_count, stored_field_count > 3 ? stored_fields[3] : "<missing>");
+        FAIL(buf);
+    }
+}
+
 // Test: Transformer uppercase
 void test_transform_uppercase(void) {
     TEST("transform uppercase");
@@ -627,6 +697,34 @@ void test_count_rows_with_config_custom_quote(void) {
     }
 }
 
+void test_count_rows_with_escape_config(void) {
+    TEST("count_rows_with_config escape char");
+
+    const char *csv =
+        "id,payload\n"
+        "1,\"{\\\n"
+        "  \\\"name\\\": \\\"alice\\\",\\\n"
+        "  \\\"nested\\\": {\\\"ok\\\": true}\\\n"
+        "}\"\n";
+    const char *path = write_temp_csv(csv);
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_parser_reuse_no_fd_leak(void) {
     TEST("parser reuse does not leak file descriptors");
 
@@ -838,6 +936,123 @@ void test_parallel_custom_quote_chunk_split(void) {
     }
 }
 
+void test_wide_multiline_json_stress(void) {
+    TEST("wide multiline JSON stress");
+
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_cisv_wide_json_%d.csv", getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    for (int col = 0; col < 128; col++) {
+        fprintf(f, "h%d%s", col, col == 127 ? "\n" : ",");
+    }
+
+    for (int row = 0; row < 256; row++) {
+        for (int col = 0; col < 128; col++) {
+            if (col == 64) {
+                fprintf(f,
+                        "\"{\n"
+                        "  \"\"id\"\": %d,\n"
+                        "  \"\"name\"\": \"\"row-%d\"\",\n"
+                        "  \"\"items\"\": [\n"
+                        "    {\"\"k\"\": \"\"a\"\", \"\"v\"\": 1},\n"
+                        "    {\"\"k\"\": \"\"b\"\", \"\"v\"\": 2}\n"
+                        "  ]\n"
+                        "}\"",
+                        row, row);
+            } else {
+                fprintf(f, "%d", row + col);
+            }
+            fputc(col == 127 ? '\n' : ',', f);
+        }
+    }
+    fclose(f);
+
+    reset_test_state();
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) {
+        unlink(path);
+        FAIL("failed to create parser");
+        return;
+    }
+
+    int rc = cisv_parser_parse_file(parser, path);
+    cisv_parser_destroy(parser);
+    size_t counted_rows = cisv_parser_count_rows(path);
+
+    int result_count = 0;
+    cisv_result_t **results = cisv_parse_file_parallel(path, &config, 4, &result_count);
+    cisv_result_t *batch = cisv_parse_file_batch(path, &config);
+
+    size_t parallel_rows = 0;
+    size_t parallel_fields = 0;
+    int parallel_ok = 1;
+    int found_multiline = 0;
+
+    if (!results || result_count <= 0) {
+        parallel_ok = 0;
+    } else {
+        for (int i = 0; i < result_count; i++) {
+            if (!results[i] || results[i]->error_code != 0) {
+                parallel_ok = 0;
+                continue;
+            }
+            parallel_rows += results[i]->row_count;
+            parallel_fields += results[i]->total_fields;
+            for (size_t r = 0; r < results[i]->row_count; r++) {
+                cisv_row_t *row = &results[i]->rows[r];
+                for (size_t c = 0; c < row->field_count; c++) {
+                    if (row->field_lengths[c] > 32 &&
+                        strstr(row->fields[c], "\"name\": \"row-0\"") != NULL &&
+                        strstr(row->fields[c], "\"items\": [") != NULL) {
+                        found_multiline = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (results) {
+        cisv_results_free(results, result_count);
+    }
+    unlink(path);
+
+    if (rc == 0 &&
+        field_count == 257 * 128 &&
+        row_count == 257 &&
+        counted_rows == 257 &&
+        batch && batch->error_code == 0 &&
+        batch->row_count == 257 &&
+        batch->total_fields == 257 * 128 &&
+        parallel_ok &&
+        parallel_rows == 257 &&
+        parallel_fields == 257 * 128 &&
+        found_multiline) {
+        PASS();
+    } else {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "callback rows=%d fields=%d rc=%d counted_rows=%zu batch_rows=%zu batch_fields=%zu parallel_rows=%zu parallel_fields=%zu parallel_ok=%d multiline=%d",
+                 row_count, field_count, rc,
+                 counted_rows,
+                 batch ? batch->row_count : 0,
+                 batch ? batch->total_fields : 0,
+                 parallel_rows, parallel_fields, parallel_ok, found_multiline);
+        FAIL(buf);
+    }
+
+    cisv_result_free(batch);
+}
+
 int main(void) {
     printf("CISV Core Library Tests\n");
     printf("========================\n\n");
@@ -849,6 +1064,8 @@ int main(void) {
     test_parse_simple();
     test_parse_custom_delimiter();
     test_parse_quoted();
+    test_parse_quote_inside_unquoted_field();
+    test_parse_backslash_escaped_json();
 
     // Transformer tests
     printf("\nTransformer Tests:\n");
@@ -873,11 +1090,13 @@ int main(void) {
     test_parse_multiline_empty_lines();
     test_parse_multiline_issue108();
     test_count_rows_with_config_custom_quote();
+    test_count_rows_with_escape_config();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
     test_parse_comment_lines();
     test_max_row_size_skip_error_lines();
     test_parallel_custom_quote_chunk_split();
+    test_wide_multiline_json_stress();
 
     // Summary
     printf("\n========================\n");
