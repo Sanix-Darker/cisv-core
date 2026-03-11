@@ -61,6 +61,7 @@ endif
 CFLAGS ?= $(BASE_CFLAGS) $(ARCH_CFLAGS)
 CFLAGS_DEBUG = -Wall -Wextra -g -O0 -fsanitize=address -fsanitize=undefined \
                -fno-omit-frame-pointer -fPIC
+DEBUG_TEST_ENV ?= ASAN_OPTIONS=detect_leaks=0
 
 VALGRIND ?= valgrind
 VALGRIND_FLAGS ?= --leak-check=full --show-leak-kinds=all --track-origins=yes --errors-for-leak-kinds=definite,possible --error-exitcode=1
@@ -69,7 +70,7 @@ VALGRIND_FLAGS ?= --leak-check=full --show-leak-kinds=all --track-origins=yes --
 ifeq ($(UNAME_S),Linux)
     # Linux: Full RELRO for GOT protection
     SECURITY_LDFLAGS = -Wl,-z,relro,-z,now
-    CFLAGS += -D_GNU_SOURCE -fstack-check
+    CFLAGS += -D_GNU_SOURCE
 else ifeq ($(UNAME_S),Darwin)
     # macOS: No RELRO equivalent, but use other hardening
     SECURITY_LDFLAGS =
@@ -174,11 +175,14 @@ test-native: $(NATIVE_TEST_BIN)
 $(NATIVE_TEST_BIN): $(NATIVE_TEST_SRC) $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $(NATIVE_TEST_SRC) $(STATIC_LIB) -lm -lpthread
 
-test-debug: $(OBJS_DEBUG)
-	$(CC) $(CFLAGS_DEBUG) -I$(INC_DIR) -o $(BUILD_DIR)/test_core_debug \
+$(BUILD_DIR)/test_core_debug: $(TEST_SRCS) $(OBJS_DEBUG)
+	$(CC) $(CFLAGS_DEBUG) -I$(INC_DIR) -o $@ \
 		$(TEST_SRCS) $(OBJS_DEBUG) -lm -lpthread
+
+test-debug:
 	@echo "Running debug tests..."
-	@./$(BUILD_DIR)/test_core_debug
+	@$(MAKE) $(BUILD_DIR)/test_core_debug
+	@$(DEBUG_TEST_ENV) ./$(BUILD_DIR)/test_core_debug
 
 # Installation
 PREFIX ?= /usr/local
@@ -202,9 +206,12 @@ uninstall:
 clean:
 	rm -rf $(BUILD_DIR)
 
-valgrind: $(TEST_BIN)
+valgrind:
 	@echo "Running core tests under valgrind..."
+	@$(MAKE) $(TEST_BIN)
 	@$(VALGRIND) $(VALGRIND_FLAGS) ./$(TEST_BIN)
 
-safety: test-debug valgrind
+safety:
+	@$(MAKE) test-debug
+	@$(MAKE) valgrind
 	@echo "Safety checks completed"

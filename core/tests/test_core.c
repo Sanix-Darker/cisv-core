@@ -84,6 +84,18 @@ static int count_open_fds(void) {
     return count;
 }
 
+static const char *describe_field(const char *value) {
+    static char preview[160];
+
+    if (!value) {
+        return "<null>";
+    }
+
+    snprintf(preview, sizeof(preview), "%.120s%s", value,
+             strlen(value) > 120 ? "..." : "");
+    return preview;
+}
+
 // Test: Config initialization
 void test_config_init(void) {
     TEST("config initialization");
@@ -282,7 +294,8 @@ void test_parse_backslash_escaped_json(void) {
     } else {
         char buf[256];
         snprintf(buf, sizeof(buf), "unexpected escaped JSON parse result: fields=%d rows=%d payload='%s'",
-                 field_count, row_count, stored_field_count > 3 ? stored_fields[3] : "<missing>");
+                 field_count, row_count,
+                 describe_field(stored_field_count > 3 ? stored_fields[3] : NULL));
         FAIL(buf);
     }
 }
@@ -488,7 +501,8 @@ void test_parse_multiline_quoted(void) {
             PASS();
         } else {
             char buf[256];
-            snprintf(buf, sizeof(buf), "multiline field mismatch: got '%s'", stored_fields[2]);
+            snprintf(buf, sizeof(buf), "multiline field mismatch: got '%s'",
+                     describe_field(stored_fields[2]));
             FAIL(buf);
         }
     } else {
@@ -574,7 +588,8 @@ void test_parse_multiline_escaped_quotes(void) {
             PASS();
         } else {
             char buf[256];
-            snprintf(buf, sizeof(buf), "field mismatch: got '%s'", stored_fields[2]);
+            snprintf(buf, sizeof(buf), "field mismatch: got '%s'",
+                     describe_field(stored_fields[2]));
             FAIL(buf);
         }
     } else {
@@ -634,7 +649,8 @@ void test_parse_multiline_empty_lines(void) {
             PASS();
         } else {
             char buf[256];
-            snprintf(buf, sizeof(buf), "field mismatch: got '%s'", stored_fields[2]);
+            snprintf(buf, sizeof(buf), "field mismatch: got '%s'",
+                     describe_field(stored_fields[2]));
             FAIL(buf);
         }
     } else {

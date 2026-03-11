@@ -322,12 +322,15 @@ int cisv_writer_field(cisv_writer *writer, const char *data, size_t len) {
         // Use SIMD version for fields >= 64 bytes
         if (len >= 64) {
             int result = write_quoted_field_simd(writer, data, len);
-            if (result == 0) goto field_done;
+            if (result == 0) {
+                writer->field_count++;
+                writer->in_field = 0;
+                return 0;
+            }
             // Fall through to non-SIMD if SIMD failed (buffer issues)
         }
 #endif
         if (write_quoted_field(writer, data, len) < 0) return -1;
-    field_done:;
     } else {
         int space_result = ensure_buffer_space(writer, len);
         if (space_result == -2) {
