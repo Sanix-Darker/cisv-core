@@ -1619,7 +1619,7 @@ cisv_parser *cisv_parser_create_with_config(const cisv_config *config) {
         p->max_row_size = cisv_adaptive_row_limit(p->memory_budget);
     }
     p->skip_lines_with_error = config->skip_lines_with_error;
-    p->has_row_controls = (p->max_row_size > 0 || config->comment != 0);
+    p->has_row_controls = (p->max_row_size > 0 || config->comment != 0 || config->skip_lines_with_error);
     p->relaxed = config->relaxed;
     p->had_error = false;
 
@@ -2468,6 +2468,7 @@ int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
 typedef struct {
     cisv_result_t *result;
     size_t current_row_start;  // Index in all_fields where current row starts
+    size_t current_row_data_start;
 } BatchCollector;
 
 // Ensure result has capacity for more rows
@@ -2616,6 +2617,7 @@ static void batch_row_cb(void *user) {
 
     r->row_count++;
     bc->current_row_start = r->total_fields;
+    bc->current_row_data_start = r->field_data_size;
 }
 
 // Finalize result by converting stored indices/offsets to actual pointers
@@ -2640,6 +2642,9 @@ static void batch_result_finalize(cisv_result_t *r) {
 static void batch_error_cb(void *user, int line, const char *msg) {
     BatchCollector *bc = (BatchCollector *)user;
     cisv_result_t *r = bc->result;
+
+    r->total_fields = bc->current_row_start;
+    r->field_data_size = bc->current_row_data_start;
 
     if (r->error_code == 0) {
         r->error_code = -1;
@@ -2785,7 +2790,8 @@ cisv_result_t *cisv_parse_file_batch(const char *path, const cisv_config *config
 
     BatchCollector bc = {
         .result = result,
-        .current_row_start = 0
+        .current_row_start = 0,
+        .current_row_data_start = 0
     };
 
     // Create config with batch callbacks
@@ -2836,7 +2842,8 @@ cisv_result_t *cisv_parse_string_batch(const char *data, size_t len, const cisv_
 
     BatchCollector bc = {
         .result = result,
-        .current_row_start = 0
+        .current_row_start = 0,
+        .current_row_data_start = 0
     };
 
     // Create config with batch callbacks
@@ -2894,7 +2901,8 @@ static void *parallel_parse_thread(void *arg) {
 
     BatchCollector bc = {
         .result = result,
-        .current_row_start = 0
+        .current_row_start = 0,
+        .current_row_data_start = 0
     };
 
     // Create config with batch callbacks

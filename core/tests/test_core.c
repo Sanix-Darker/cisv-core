@@ -2209,6 +2209,39 @@ void test_max_row_size_skip_error_lines(void) {
     }
 }
 
+void test_batch_skip_error_rolls_back_fields(void) {
+    TEST("batch skip_lines_with_error rolls back malformed row fields");
+
+    const char *csv = "a,b\n\"bad\"x,y\n1,2\n";
+    cisv_config config;
+    cisv_config_init(&config);
+    config.skip_lines_with_error = true;
+
+    cisv_result_t *result = cisv_parse_string_batch(csv, strlen(csv), &config);
+    if (!result) {
+        FAIL("batch parse returned null");
+        return;
+    }
+
+    int ok = result->error_code != 0 &&
+             result->row_count == 2 &&
+             result->total_fields == 4 &&
+             result->rows[0].field_count == 2 &&
+             result->rows[1].field_count == 2 &&
+             strcmp(result->rows[0].fields[0], "a") == 0 &&
+             strcmp(result->rows[0].fields[1], "b") == 0 &&
+             strcmp(result->rows[1].fields[0], "1") == 0 &&
+             strcmp(result->rows[1].fields[1], "2") == 0;
+
+    cisv_result_free(result);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("expected only header and final row after malformed row rollback");
+    }
+}
+
 void test_parallel_custom_quote_chunk_split(void) {
     TEST("parallel parse uses custom quote in chunk splitting");
 
@@ -2603,6 +2636,7 @@ int main(void) {
     test_malformed_quote_errors();
     test_parse_comment_lines();
     test_max_row_size_skip_error_lines();
+    test_batch_skip_error_rolls_back_fields();
     test_parallel_custom_quote_chunk_split();
     test_parallel_custom_escape_chunk_split();
     test_parallel_malformed_quote_errors();
