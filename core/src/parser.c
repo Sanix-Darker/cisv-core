@@ -11,7 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#ifdef __AVX512F__
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 #include <immintrin.h>
 #endif
 
@@ -1886,6 +1886,58 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
     size_t i = 0;
 
     *needs_fallback = false;
+
+#ifdef __AVX512F__
+    const __m512i nl_v = _mm512_set1_epi8('\n');
+    const __m512i cr_v = _mm512_set1_epi8('\r');
+    const __m512i quote_v = _mm512_set1_epi8((char)quote_char);
+
+    while (i + 64 <= size) {
+        __m512i chunk = _mm512_loadu_si512((const void *)(data + i));
+        __mmask64 quote_mask = _mm512_cmpeq_epi8_mask(chunk, quote_v);
+        __mmask64 cr_mask = _mm512_cmpeq_epi8_mask(chunk, cr_v);
+        if (quote_mask | cr_mask) {
+            *needs_fallback = true;
+            return 0;
+        }
+        count += (size_t)__builtin_popcountll((uint64_t)_mm512_cmpeq_epi8_mask(chunk, nl_v));
+        i += 64;
+    }
+#elif defined(__AVX2__)
+    const __m256i nl_v = _mm256_set1_epi8('\n');
+    const __m256i cr_v = _mm256_set1_epi8('\r');
+    const __m256i quote_v = _mm256_set1_epi8((char)quote_char);
+
+    while (i + 32 <= size) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(data + i));
+        __m256i quote_cmp = _mm256_cmpeq_epi8(chunk, quote_v);
+        __m256i cr_cmp = _mm256_cmpeq_epi8(chunk, cr_v);
+        if (_mm256_movemask_epi8(_mm256_or_si256(quote_cmp, cr_cmp)) != 0) {
+            *needs_fallback = true;
+            return 0;
+        }
+        __m256i nl_cmp = _mm256_cmpeq_epi8(chunk, nl_v);
+        count += (size_t)__builtin_popcount((unsigned)_mm256_movemask_epi8(nl_cmp));
+        i += 32;
+    }
+#elif defined(__SSE2__)
+    const __m128i nl_v = _mm_set1_epi8('\n');
+    const __m128i cr_v = _mm_set1_epi8('\r');
+    const __m128i quote_v = _mm_set1_epi8((char)quote_char);
+
+    while (i + 16 <= size) {
+        __m128i chunk = _mm_loadu_si128((const __m128i *)(data + i));
+        __m128i quote_cmp = _mm_cmpeq_epi8(chunk, quote_v);
+        __m128i cr_cmp = _mm_cmpeq_epi8(chunk, cr_v);
+        if (_mm_movemask_epi8(_mm_or_si128(quote_cmp, cr_cmp)) != 0) {
+            *needs_fallback = true;
+            return 0;
+        }
+        __m128i nl_cmp = _mm_cmpeq_epi8(chunk, nl_v);
+        count += (size_t)__builtin_popcount((unsigned)_mm_movemask_epi8(nl_cmp));
+        i += 16;
+    }
+#endif
 
     while (i + 16 <= size) {
         uint64_t word0;
