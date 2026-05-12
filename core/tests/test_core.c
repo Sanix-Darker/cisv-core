@@ -636,6 +636,65 @@ void test_transform_pipeline(void) {
     }
 }
 
+void test_transform_rejects_unsupported_builtins(void) {
+    TEST("transform rejects unsupported builtins");
+
+    cisv_transform_pipeline_t *pipeline = cisv_transform_pipeline_create(2);
+    if (!pipeline) {
+        FAIL("failed to create pipeline");
+        return;
+    }
+
+    int rc_none = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_NONE, NULL);
+    int rc_sha = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_HASH_SHA256, NULL);
+    int rc_md5 = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_HASH_MD5, NULL);
+    int rc_decode = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_BASE64_DECODE, NULL);
+    int rc_encrypt = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_ENCRYPT_AES256, NULL);
+
+    cisv_transform_result_t direct_sha = cisv_transform_hash_sha256("hello", 5, NULL);
+    int success = (rc_none < 0 &&
+                   rc_sha < 0 &&
+                   rc_md5 < 0 &&
+                   rc_decode < 0 &&
+                   rc_encrypt < 0 &&
+                   pipeline->count == 0 &&
+                   direct_sha.data == NULL &&
+                   direct_sha.len == 0 &&
+                   direct_sha.needs_free == 0);
+
+    cisv_transform_result_free(&direct_sha);
+    cisv_transform_pipeline_destroy(pipeline);
+
+    if (success) {
+        PASS();
+    } else {
+        FAIL("unsupported transforms must fail instead of no-op/mock behavior");
+    }
+}
+
+void test_transform_add_by_name_rejects_unsupported(void) {
+    TEST("transform by name rejects unsupported builtins");
+
+    cisv_transform_pipeline_t *pipeline = cisv_transform_pipeline_create(2);
+    if (!pipeline) {
+        FAIL("failed to create pipeline");
+        return;
+    }
+
+    const char *headers[] = {"id", "value"};
+    int header_rc = cisv_transform_pipeline_set_header(pipeline, headers, 2);
+    int add_rc = cisv_transform_pipeline_add_by_name(pipeline, "value", TRANSFORM_HASH_SHA256, NULL);
+
+    int success = (header_rc == 0 && add_rc < 0 && pipeline->count == 0);
+    cisv_transform_pipeline_destroy(pipeline);
+
+    if (success) {
+        PASS();
+    } else {
+        FAIL("unsupported name-based transform was accepted");
+    }
+}
+
 // Test: Writer basic
 void test_writer_basic(void) {
     TEST("writer basic");
@@ -1229,6 +1288,77 @@ void test_streaming_rfc_quote_across_chunk_boundary(void) {
     }
 }
 
+void test_streaming_custom_escape_across_chunk_boundary(void) {
+    TEST("streaming custom escape across chunk boundary");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *chunk1 = "\"a\\";
+    const char *chunk2 = "\"b\",c\n";
+    int rc1 = cisv_parser_write(parser, (const uint8_t *)chunk1, strlen(chunk1));
+    int rc2 = cisv_parser_write(parser, (const uint8_t *)chunk2, strlen(chunk2));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (rc1 == 0 && rc2 == 0 &&
+        error_count == 0 &&
+        field_count == 2 &&
+        row_count == 1 &&
+        strcmp(stored_fields[0], "a\"b") == 0 &&
+        strcmp(stored_fields[1], "c") == 0) {
+        PASS();
+    } else {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "expected custom escaped quote across chunks, got fields=%d rows=%d errors=%d first='%s'",
+                 field_count, row_count, error_count,
+                 stored_field_count > 0 ? stored_fields[0] : "");
+        FAIL(buf);
+    }
+}
+
+void test_streaming_custom_escape_eof_error(void) {
+    TEST("streaming custom escape at EOF reports error");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *chunk = "\"a\\";
+    int rc = cisv_parser_write(parser, (const uint8_t *)chunk, strlen(chunk));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (rc == 0 &&
+        error_count == 1 &&
+        field_count == 1 &&
+        row_count == 1 &&
+        strcmp(stored_fields[0], "a") == 0) {
+        PASS();
+    } else {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "expected malformed escape EOF error with partial field, got fields=%d rows=%d errors=%d first='%s'",
+                 field_count, row_count, error_count,
+                 stored_field_count > 0 ? stored_fields[0] : "");
+        FAIL(buf);
+    }
+}
+
 void test_skip_empty_preserves_empty_fields(void) {
     TEST("skip_empty_lines preserves empty fields");
     reset_test_state();
@@ -1701,6 +1831,8 @@ int main(void) {
     test_transform_lowercase();
     test_transform_trim();
     test_transform_pipeline();
+    test_transform_rejects_unsupported_builtins();
+    test_transform_add_by_name_rejects_unsupported();
     test_base64_encode();
 
     // Writer tests
@@ -1725,6 +1857,8 @@ int main(void) {
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
     test_streaming_rfc_quote_across_chunk_boundary();
+    test_streaming_custom_escape_across_chunk_boundary();
+    test_streaming_custom_escape_eof_error();
     test_skip_empty_preserves_empty_fields();
     test_batch_line_range_grouping();
     test_trailing_empty_field_at_eof();

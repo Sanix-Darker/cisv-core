@@ -87,6 +87,7 @@ typedef struct cisv_parser {
     const uint8_t *quoted_field_start;
     bool quoted_field_buffered;
     bool quoted_pending_quote;
+    bool quoted_pending_escape;
 
     // Buffer for streaming mode - holds partial unquoted fields across chunks
     uint8_t *stream_buffer;
@@ -632,6 +633,10 @@ static inline void yield_quoted_field(cisv_parser *p) {
 
         if (p->skip_current_row) {
             p->quote_buffer_pos = 0;
+            p->quoted_field_start = NULL;
+            p->quoted_field_buffered = false;
+            p->quoted_pending_quote = false;
+            p->quoted_pending_escape = false;
             return;
         }
     }
@@ -646,6 +651,7 @@ static inline void yield_quoted_field(cisv_parser *p) {
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
     p->quoted_pending_quote = false;
+    p->quoted_pending_escape = false;
 }
 
 static inline void yield_quoted_span(cisv_parser *p, const uint8_t *start, const uint8_t *end) {
@@ -720,8 +726,24 @@ static inline bool append_current_quoted_segment(cisv_parser *p, const uint8_t *
 static inline void consume_quoted_field(cisv_parser *p) {
     const uint8_t *segment_start = p->cur;
 
+    if (p->quoted_pending_escape) {
+        p->quoted_pending_escape = false;
+        if (p->cur >= p->end) {
+            return;
+        }
+        if (!append_to_quote_buffer(p, p->cur, 1)) {
+            parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
+            p->cur = p->end;
+            return;
+        }
+        p->quoted_field_buffered = true;
+        p->cur++;
+        segment_start = p->cur;
+    }
+
     if (p->quoted_pending_quote) {
         p->quoted_pending_quote = false;
+        p->quoted_pending_escape = false;
         if (p->cur < p->end && *p->cur == (uint8_t)p->quote) {
             if (!append_to_quote_buffer(p, p->cur, 1)) {
                 parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
@@ -737,6 +759,7 @@ static inline void consume_quoted_field(cisv_parser *p) {
             p->quoted_field_start = NULL;
             p->quoted_field_buffered = false;
             p->quoted_pending_quote = false;
+            p->quoted_pending_escape = false;
             consume_post_quoted_delimiter(p);
             return;
         }
@@ -778,11 +801,8 @@ static inline void consume_quoted_field(cisv_parser *p) {
 
             if (special + 1 >= p->end) {
                 if (p->streaming_mode) {
-                    if (!append_to_quote_buffer(p, special, 1)) {
-                        parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
-                    } else {
-                        p->quoted_field_buffered = true;
-                    }
+                    p->quoted_pending_escape = true;
+                    p->quoted_field_buffered = true;
                 } else {
                     parser_report_error(p, p->line_num + 1, "Malformed escape at EOF");
                 }
@@ -824,6 +844,7 @@ static inline void consume_quoted_field(cisv_parser *p) {
                 return;
             }
             p->quoted_pending_quote = true;
+            p->quoted_pending_escape = false;
             p->quoted_field_buffered = true;
             p->cur = p->end;
             return;
@@ -844,6 +865,7 @@ static inline void consume_quoted_field(cisv_parser *p) {
         p->quoted_field_start = NULL;
         p->quoted_field_buffered = false;
         p->quoted_pending_quote = false;
+        p->quoted_pending_escape = false;
         consume_post_quoted_delimiter(p);
         return;
     }
@@ -1024,6 +1046,7 @@ static void parse_avx512(cisv_parser *p) {
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
                         p->quoted_pending_quote = false;
+                        p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -1061,6 +1084,7 @@ static void parse_avx512(cisv_parser *p) {
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
                 p->quoted_pending_quote = false;
+                p->quoted_pending_escape = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1145,6 +1169,7 @@ static void parse_avx2(cisv_parser *p) {
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
                         p->quoted_pending_quote = false;
+                        p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -1182,6 +1207,7 @@ static void parse_avx2(cisv_parser *p) {
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
                 p->quoted_pending_quote = false;
+                p->quoted_pending_escape = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1273,6 +1299,7 @@ static void parse_neon(cisv_parser *p) {
                     p->quoted_field_start = p->cur;
                     p->quoted_field_buffered = false;
                     p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
                     consume_quoted_field(p);
                     break;
                 } else {
@@ -1309,6 +1336,7 @@ static void parse_neon(cisv_parser *p) {
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
                 p->quoted_pending_quote = false;
+                p->quoted_pending_escape = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1390,6 +1418,7 @@ static void parse_sse2(cisv_parser *p) {
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
                         p->quoted_pending_quote = false;
+                        p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -1427,6 +1456,7 @@ static void parse_sse2(cisv_parser *p) {
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
                 p->quoted_pending_quote = false;
+                p->quoted_pending_escape = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1499,6 +1529,7 @@ static void parse_scalar(cisv_parser *p) {
                     p->quoted_field_start = p->cur;
                     p->quoted_field_buffered = false;
                     p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
                     consume_quoted_field(p);
                     break;
                 } else {
@@ -1534,6 +1565,7 @@ static void parse_scalar(cisv_parser *p) {
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
                 p->quoted_pending_quote = false;
+                p->quoted_pending_escape = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1614,6 +1646,8 @@ cisv_parser *cisv_parser_create_with_config(const cisv_config *config) {
         return NULL;
     }
     p->quote_buffer_pos = 0;
+    p->quoted_pending_quote = false;
+    p->quoted_pending_escape = false;
 
     // Allocate stream buffer for streaming mode.
     p->stream_buffer_size = MIN_BUFFER_INCREMENT;
@@ -1716,6 +1750,7 @@ int cisv_parser_parse_file(cisv_parser *p, const char *path) {
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
     p->quoted_pending_quote = false;
+    p->quoted_pending_escape = false;
     p->stream_buffer_pos = 0;
     p->streaming_mode = false;
     p->current_row_size = 0;
@@ -1893,8 +1928,19 @@ void cisv_parser_end(cisv_parser *p) {
 
     if (p->streaming_mode) {
         bool finalized_pending_quote = false;
-        if (p->state == S_QUOTED && p->quoted_pending_quote) {
+        if (p->state == S_QUOTED && p->quoted_pending_escape) {
+            p->quoted_pending_escape = false;
+            parser_report_error(p, p->line_num + 1, "Malformed escape at EOF");
+            if (p->quote_buffer_pos > 0) {
+                yield_quoted_field(p);
+            }
+            p->state = S_NORMAL;
+            p->quoted_field_start = NULL;
+            p->quoted_field_buffered = false;
+            finalized_pending_quote = true;
+        } else if (p->state == S_QUOTED && p->quoted_pending_quote) {
             p->quoted_pending_quote = false;
+            p->quoted_pending_escape = false;
             yield_quoted_field(p);
             p->state = S_NORMAL;
             p->quoted_field_start = NULL;
@@ -2125,6 +2171,7 @@ int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
     p->quoted_pending_quote = false;
+    p->quoted_pending_escape = false;
     p->current_row_fields = 0;
     p->current_row_size = 0;
     p->skip_current_row = false;

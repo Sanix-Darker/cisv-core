@@ -166,6 +166,8 @@ cisv_transform_result_t cisv_transform_lowercase(const char *data, size_t len, c
 cisv_transform_result_t cisv_transform_trim(const char *data, size_t len, cisv_transform_context_t *ctx);
 cisv_transform_result_t cisv_transform_to_int(const char *data, size_t len, cisv_transform_context_t *ctx);
 cisv_transform_result_t cisv_transform_to_float(const char *data, size_t len, cisv_transform_context_t *ctx);
+// SHA256 is intentionally unsupported until backed by a real crypto provider.
+// The function returns {NULL, 0, 0}; pipeline registration rejects this type.
 cisv_transform_result_t cisv_transform_hash_sha256(const char *data, size_t len, cisv_transform_context_t *ctx);
 cisv_transform_result_t cisv_transform_base64_encode(const char *data, size_t len, cisv_transform_context_t *ctx);
 

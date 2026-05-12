@@ -197,7 +197,6 @@ static cisv_transform_fn get_transform_function(cisv_transform_type_t type) {
         case TRANSFORM_TRIM: return cisv_transform_trim;
         case TRANSFORM_TO_INT: return cisv_transform_to_int;
         case TRANSFORM_TO_FLOAT: return cisv_transform_to_float;
-        case TRANSFORM_HASH_SHA256: return cisv_transform_hash_sha256;
         case TRANSFORM_BASE64_ENCODE: return cisv_transform_base64_encode;
         default: return NULL;
     }
@@ -209,7 +208,10 @@ int cisv_transform_pipeline_add(
     cisv_transform_type_t type,
     cisv_transform_context_t *ctx
 ) {
-    if (!pipeline || type >= TRANSFORM_MAX) return -1;
+    if (!pipeline || type <= TRANSFORM_NONE || type >= TRANSFORM_MAX) return -1;
+
+    cisv_transform_fn fn = get_transform_function(type);
+    if (!fn) return -1;
 
     if (pipeline->count >= pipeline->capacity) {
         size_t new_capacity = pipeline->capacity * 2;
@@ -229,7 +231,7 @@ int cisv_transform_pipeline_add(
     cisv_transform_t *t = &pipeline->transforms[pipeline->count];
     t->type = type;
     t->field_index = field_index;
-    t->fn = get_transform_function(type);
+    t->fn = fn;
     t->ctx = ctx;
     t->js_callback = NULL;
 
@@ -757,54 +759,13 @@ cisv_transform_result_t cisv_transform_to_float(const char *data, size_t len, ci
     return result;
 }
 
-/**
- * ============================================================================
- * WARNING: MOCK IMPLEMENTATION - NOT CRYPTOGRAPHICALLY SECURE
- * ============================================================================
- *
- * This function does NOT provide real SHA256 hashing. It generates a
- * deterministic but INSECURE pseudo-hash based only on input length.
- *
- * DO NOT USE FOR:
- * - Password hashing or verification
- * - Data integrity verification
- * - Digital signatures
- * - Any security-sensitive operations
- *
- * This is a PLACEHOLDER for API demonstration purposes only.
- * For real cryptographic operations, integrate a proper library such as:
- * - OpenSSL (libcrypto)
- * - libsodium
- * - mbedTLS
- *
- * ============================================================================
- */
 cisv_transform_result_t cisv_transform_hash_sha256(const char *data, size_t len, cisv_transform_context_t *ctx) {
+    (void)data;
+    (void)len;
     (void)ctx;
 
-    cisv_transform_result_t result;
-    result.data = malloc(128);
-    if (!result.data) {
-        result.data = (char*)data;
-        result.len = len;
-        result.needs_free = 0;
-        return result;
-    }
-
-    // ========================================================================
-    // MOCK HASH - NOT REAL CRYPTOGRAPHY - DO NOT USE FOR SECURITY PURPOSES
-    // This generates a predictable string based solely on input length.
-    // A real implementation should use OpenSSL, libsodium, or similar.
-    // ========================================================================
-    int written = snprintf(result.data, 128, "MOCK_SHA256_%016lx%016lx%016lx%016lx",
-             (unsigned long)len,
-             (unsigned long)(len * 0x1234567890ABCDEF),
-             (unsigned long)(len * 0xFEDCBA0987654321),
-             (unsigned long)(len * 0xDEADBEEFC0FFEE00));
-
-    result.len = (written > 0 && written < 128) ? (size_t)written : 64;
-    result.needs_free = 1;
-    return result;
+    cisv_transform_result_t unsupported = {0};
+    return unsupported;
 }
 
 static const char base64_chars[] =
