@@ -3112,6 +3112,7 @@ struct cisv_iterator {
     char delimiter;
     char quote;
     char escape;
+    bool relaxed;
     bool trim;
     bool skip_empty_lines;
     char comment;
@@ -3310,6 +3311,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->delimiter = config ? config->delimiter : ',';
         it->quote = config ? config->quote : '"';
         it->escape = config ? config->escape : '\0';
+        it->relaxed = config ? config->relaxed : false;
         it->trim = config ? config->trim : false;
         it->skip_empty_lines = config ? config->skip_empty_lines : false;
         it->comment = config ? config->comment : '\0';
@@ -3357,6 +3359,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->delimiter = config->delimiter;
         it->quote = config->quote;
         it->escape = config->escape;
+        it->relaxed = config->relaxed;
         it->trim = config->trim;
         it->skip_empty_lines = config->skip_empty_lines;
         it->comment = config->comment;
@@ -3371,6 +3374,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->delimiter = ',';
         it->quote = '"';
         it->escape = '\0';
+        it->relaxed = false;
         it->trim = false;
         it->skip_empty_lines = false;
         it->comment = '\0';
@@ -3552,6 +3556,10 @@ restart_row:
                     it->state = S_NORMAL;
                     it->pos++;
 
+                    while (it->pos < it->end && (*it->pos == ' ' || *it->pos == '\t')) {
+                        it->pos++;
+                    }
+
                     // Skip delimiter or newline after closing quote
                     if (it->pos < it->end) {
                         if (*it->pos == it->delimiter) {
@@ -3573,6 +3581,9 @@ restart_row:
                                 goto restart_row;
                             }
                             return finished;
+                        } else if (!it->relaxed) {
+                            it->error_code = EINVAL;
+                            return CISV_ITER_ERROR;
                         }
                     }
                     field_start = it->pos;
@@ -3592,6 +3603,10 @@ restart_row:
     // End of file - handle last field if any
     if (field_start < it->end || it->quote_buffer_pos > 0) {
         if (it->state == S_QUOTED) {
+            if (!it->relaxed) {
+                it->error_code = EINVAL;
+                return CISV_ITER_ERROR;
+            }
             // Unterminated quote - yield what we have
             if (it->trim) {
                 const uint8_t *qstart = it->quote_buffer;

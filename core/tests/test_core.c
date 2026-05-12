@@ -478,6 +478,102 @@ void test_iterator_custom_escape_eof_error(void) {
     }
 }
 
+void test_iterator_malformed_quote_errors(void) {
+    TEST("iterator strict malformed quoted fields error");
+
+    const char *path = write_temp_csv("\"a\"x,b\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    cisv_iterator_close(it);
+
+    config.relaxed = true;
+    it = cisv_iterator_open(path, &config);
+    int relaxed_rc = CISV_ITER_ERROR;
+    size_t relaxed_fields = 0;
+    if (it) {
+        relaxed_rc = cisv_iterator_next(it, &fields, &lengths, &relaxed_fields);
+        cisv_iterator_close(it);
+    }
+
+    unlink(path);
+
+    if (rc == CISV_ITER_ERROR &&
+        relaxed_rc == CISV_ITER_OK &&
+        relaxed_fields == 3) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected strict error and relaxed recovery, got rc=%d relaxed=%d relaxed_fields=%zu",
+                 rc, relaxed_rc, relaxed_fields);
+        FAIL(buf);
+    }
+}
+
+void test_iterator_unterminated_quote_errors(void) {
+    TEST("iterator strict unterminated quote errors");
+
+    const char *path = write_temp_csv("\"unterminated");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    cisv_iterator_close(it);
+
+    config.relaxed = true;
+    it = cisv_iterator_open(path, &config);
+    int relaxed_rc = CISV_ITER_ERROR;
+    size_t relaxed_fields = 0;
+    if (it) {
+        relaxed_rc = cisv_iterator_next(it, &fields, &lengths, &relaxed_fields);
+        cisv_iterator_close(it);
+    }
+
+    unlink(path);
+
+    if (rc == CISV_ITER_ERROR &&
+        relaxed_rc == CISV_ITER_OK &&
+        relaxed_fields == 1) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected strict EOF error and relaxed recovery, got rc=%d relaxed=%d relaxed_fields=%zu",
+                 rc, relaxed_rc, relaxed_fields);
+        FAIL(buf);
+    }
+}
+
 void test_iterator_row_controls(void) {
     TEST("iterator respects comments and line ranges");
 
@@ -2408,6 +2504,8 @@ int main(void) {
     test_iterator_resource_row_limit();
     test_iterator_custom_escape_values();
     test_iterator_custom_escape_eof_error();
+    test_iterator_malformed_quote_errors();
+    test_iterator_unterminated_quote_errors();
     test_iterator_row_controls();
     test_iterator_skip_empty_and_quoted_comment_parity();
     test_parse_simple();
