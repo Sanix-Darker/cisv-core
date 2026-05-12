@@ -2480,6 +2480,44 @@ void cisv_mmap_close(cisv_mmap_file_t *file) {
     free(file);
 }
 
+static size_t count_chunk_rows_quote_aware(const uint8_t *start,
+                                           const uint8_t *end,
+                                           char quote_char,
+                                           char escape_char) {
+    size_t rows = 0;
+    bool in_quote = false;
+
+    for (const uint8_t *p = start; p < end; p++) {
+        uint8_t c = *p;
+        if (in_quote) {
+            if (escape_char != '\0' && c == (uint8_t)escape_char) {
+                if (p + 1 < end) {
+                    p++;
+                }
+            } else if (c == (uint8_t)quote_char) {
+                if (p + 1 < end && *(p + 1) == (uint8_t)quote_char) {
+                    p++;
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else {
+            if (c == '\n') {
+                rows++;
+            } else if (c == '\r') {
+                rows++;
+                if (p + 1 < end && *(p + 1) == '\n') {
+                    p++;
+                }
+            } else if (c == (uint8_t)quote_char) {
+                in_quote = true;
+            }
+        }
+    }
+
+    return rows;
+}
+
 static cisv_chunk_t *split_chunks_with_quote(
     const cisv_mmap_file_t *file,
     int num_chunks,
@@ -2526,43 +2564,27 @@ static cisv_chunk_t *split_chunks_with_quote(
                 scan += 2;
                 continue;
             }
-        } else if (c == '\n' && !in_quote &&
-                   (size_t)((scan + 1) - data) >= next_target) {
-            const uint8_t *target_end = scan + 1;
-
-            size_t row_count = 0;
-            bool chunk_in_quote = false;
-            for (const uint8_t *p = chunk_start; p < target_end; p++) {
-                uint8_t ch = *p;
-                if (chunk_in_quote) {
-                    if (escape_char != '\0' && ch == (uint8_t)escape_char) {
-                        if (p + 1 < target_end) {
-                            p++;
-                        }
-                    } else if (ch == (uint8_t)quote_char) {
-                        if (p + 1 < target_end && *(p + 1) == (uint8_t)quote_char) {
-                            p++;
-                        } else {
-                            chunk_in_quote = false;
-                        }
-                    }
-                } else {
-                    if (ch == '\n') {
-                        row_count++;
-                    } else if (ch == (uint8_t)quote_char) {
-                        chunk_in_quote = true;
-                    }
-                }
+        } else if (!in_quote && (c == '\n' || c == '\r')) {
+            const uint8_t *row_end = scan + 1;
+            if (c == '\r' && row_end < end && *row_end == '\n') {
+                row_end++;
             }
+            if ((size_t)(row_end - data) >= next_target) {
+                const uint8_t *target_end = row_end;
+                size_t row_count = count_chunk_rows_quote_aware(chunk_start, target_end,
+                                                                quote_char, escape_char);
 
-            chunks[actual_chunks].start = chunk_start;
-            chunks[actual_chunks].end = target_end;
-            chunks[actual_chunks].row_count = row_count;
-            chunks[actual_chunks].chunk_index = actual_chunks;
+                chunks[actual_chunks].start = chunk_start;
+                chunks[actual_chunks].end = target_end;
+                chunks[actual_chunks].row_count = row_count;
+                chunks[actual_chunks].chunk_index = actual_chunks;
 
-            chunk_start = target_end;
-            actual_chunks++;
-            next_target += chunk_size;
+                chunk_start = target_end;
+                actual_chunks++;
+                next_target += chunk_size;
+            }
+            scan = row_end;
+            continue;
         }
 
         scan++;
@@ -2573,30 +2595,8 @@ static cisv_chunk_t *split_chunks_with_quote(
 
         // Count rows in this chunk using quote-aware scalar loop.
         // chunk_start is always at a row boundary, so initial state is outside quotes.
-        size_t row_count = 0;
-        bool chunk_in_quote = false;
-        for (const uint8_t *p = chunk_start; p < target_end; p++) {
-            uint8_t c = *p;
-            if (chunk_in_quote) {
-                if (escape_char != '\0' && c == (uint8_t)escape_char) {
-                    if (p + 1 < target_end) {
-                        p++;
-                    }
-                } else if (c == (uint8_t)quote_char) {
-                    if (p + 1 < target_end && *(p + 1) == (uint8_t)quote_char) {
-                        p++;  // Skip escaped quote
-                    } else {
-                        chunk_in_quote = false;
-                    }
-                }
-            } else {
-                if (c == '\n') {
-                    row_count++;
-                } else if (c == (uint8_t)quote_char) {
-                    chunk_in_quote = true;
-                }
-            }
-        }
+        size_t row_count = count_chunk_rows_quote_aware(chunk_start, target_end,
+                                                        quote_char, escape_char);
 
         chunks[actual_chunks].start = chunk_start;
         chunks[actual_chunks].end = target_end;

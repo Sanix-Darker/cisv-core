@@ -2534,6 +2534,61 @@ void test_parallel_custom_escape_chunk_split(void) {
     }
 }
 
+void test_parallel_cr_only_chunk_split(void) {
+    TEST("parallel parse splits CR-only row endings");
+
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_cisv_parallel_cr_%d.csv", getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    for (int i = 0; i < 5000; i++) {
+        fprintf(f, "%d,%d\r", i, i + 1);
+    }
+    fclose(f);
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    int result_count = 0;
+    cisv_result_t **results = cisv_parse_file_parallel(path, &config, 4, &result_count);
+    if (!results || result_count <= 0) {
+        unlink(path);
+        FAIL("parallel parse failed");
+        return;
+    }
+
+    size_t total_rows = 0;
+    size_t total_fields = 0;
+    int had_error = 0;
+
+    for (int i = 0; i < result_count; i++) {
+        cisv_result_t *r = results[i];
+        if (!r || r->error_code != 0) {
+            had_error = 1;
+            continue;
+        }
+        total_rows += r->row_count;
+        total_fields += r->total_fields;
+    }
+
+    cisv_results_free(results, result_count);
+    unlink(path);
+
+    if (!had_error && result_count > 1 && total_rows == 5000 && total_fields == 10000) {
+        PASS();
+    } else {
+        char buf[180];
+        snprintf(buf, sizeof(buf),
+                 "expected split CR rows=5000 fields=10000 chunks>1, got rows=%zu fields=%zu chunks=%d error=%d",
+                 total_rows, total_fields, result_count, had_error);
+        FAIL(buf);
+    }
+}
+
 void test_parallel_malformed_quote_errors(void) {
     TEST("parallel parse surfaces malformed quote errors");
 
@@ -2772,6 +2827,7 @@ int main(void) {
     test_batch_skip_error_rolls_back_fields();
     test_parallel_custom_quote_chunk_split();
     test_parallel_custom_escape_chunk_split();
+    test_parallel_cr_only_chunk_split();
     test_parallel_malformed_quote_errors();
     test_wide_multiline_json_stress();
 
