@@ -152,6 +152,18 @@ int cisv_transform_pipeline_add_by_name(
     cisv_transform_context_t *ctx
 );
 
+// Remove all transforms registered for a field index. Returns removed count or -1 on invalid input.
+int cisv_transform_pipeline_remove_field(
+    cisv_transform_pipeline_t *pipeline,
+    int field_index
+);
+
+// Remove all transforms registered for a field name. Returns removed count or -1 on invalid input.
+int cisv_transform_pipeline_remove_by_name(
+    cisv_transform_pipeline_t *pipeline,
+    const char *field_name
+);
+
 // Apply transforms
 cisv_transform_result_t cisv_transform_apply(
     cisv_transform_pipeline_t *pipeline,

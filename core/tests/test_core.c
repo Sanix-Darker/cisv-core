@@ -780,6 +780,69 @@ void test_transform_add_by_name_rejects_unsupported(void) {
     }
 }
 
+void test_transform_remove_field_rebuilds_index(void) {
+    TEST("transform remove field rebuilds index");
+
+    cisv_transform_pipeline_t *pipeline = cisv_transform_pipeline_create(2);
+    if (!pipeline) {
+        FAIL("failed to create pipeline");
+        return;
+    }
+
+    int add0 = cisv_transform_pipeline_add(pipeline, 0, TRANSFORM_UPPERCASE, NULL);
+    int add1 = cisv_transform_pipeline_add(pipeline, 1, TRANSFORM_LOWERCASE, NULL);
+    cisv_transform_result_t before = cisv_transform_apply(pipeline, 0, "abc", 3);
+    cisv_transform_result_free(&before);
+
+    int removed = cisv_transform_pipeline_remove_field(pipeline, 0);
+    cisv_transform_result_t field0 = cisv_transform_apply(pipeline, 0, "abc", 3);
+    cisv_transform_result_t field1 = cisv_transform_apply(pipeline, 1, "XYZ", 3);
+
+    int ok = (add0 == 0 && add1 == 0 && removed == 1 &&
+              field0.len == 3 && memcmp(field0.data, "abc", 3) == 0 &&
+              field1.len == 3 && memcmp(field1.data, "xyz", 3) == 0 &&
+              pipeline->count == 1);
+
+    cisv_transform_result_free(&field0);
+    cisv_transform_result_free(&field1);
+    cisv_transform_pipeline_destroy(pipeline);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("field transform removal did not preserve remaining transforms");
+    }
+}
+
+void test_transform_remove_by_name(void) {
+    TEST("transform remove by name");
+
+    cisv_transform_pipeline_t *pipeline = cisv_transform_pipeline_create(2);
+    if (!pipeline) {
+        FAIL("failed to create pipeline");
+        return;
+    }
+
+    const char *headers[] = {"id", "value"};
+    int header_rc = cisv_transform_pipeline_set_header(pipeline, headers, 2);
+    int add_rc = cisv_transform_pipeline_add_by_name(pipeline, "value", TRANSFORM_UPPERCASE, NULL);
+    int removed = cisv_transform_pipeline_remove_by_name(pipeline, "value");
+    cisv_transform_result_t result = cisv_transform_apply(pipeline, 1, "abc", 3);
+
+    int ok = (header_rc == 0 && add_rc == 0 && removed == 1 &&
+              result.len == 3 && memcmp(result.data, "abc", 3) == 0 &&
+              pipeline->count == 0);
+
+    cisv_transform_result_free(&result);
+    cisv_transform_pipeline_destroy(pipeline);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("name transform removal failed");
+    }
+}
+
 // Test: Writer basic
 void test_writer_basic(void) {
     TEST("writer basic");
@@ -2246,6 +2309,8 @@ int main(void) {
     test_transform_pipeline();
     test_transform_rejects_unsupported_builtins();
     test_transform_add_by_name_rejects_unsupported();
+    test_transform_remove_field_rebuilds_index();
+    test_transform_remove_by_name();
     test_base64_encode();
 
     // Writer tests

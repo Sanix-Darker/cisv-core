@@ -53,6 +53,29 @@ static inline int hash_table_lookup(cisv_transform_pipeline_t *pipeline, const c
     return -1;  // Table full, not found
 }
 
+static void free_transform_context(cisv_transform_t *transform) {
+    if (!transform || !transform->ctx) {
+        return;
+    }
+
+    if (transform->ctx->key) {
+        memset(transform->ctx->key, 0, transform->ctx->key_len);
+        free(transform->ctx->key);
+        transform->ctx->key = NULL;
+    }
+    if (transform->ctx->iv) {
+        memset(transform->ctx->iv, 0, transform->ctx->iv_len);
+        free(transform->ctx->iv);
+        transform->ctx->iv = NULL;
+    }
+    if (transform->ctx->extra) {
+        free(transform->ctx->extra);
+        transform->ctx->extra = NULL;
+    }
+    free(transform->ctx);
+    transform->ctx = NULL;
+}
+
 // Build hash table from header fields
 static void build_header_hash_table(cisv_transform_pipeline_t *pipeline) {
     if (!pipeline->header_fields || pipeline->header_count == 0) {
@@ -130,24 +153,7 @@ void cisv_transform_pipeline_destroy(cisv_transform_pipeline_t *pipeline) {
     if (!pipeline) return;
 
     for (size_t i = 0; i < pipeline->count; i++) {
-        if (pipeline->transforms[i].ctx) {
-            if (pipeline->transforms[i].ctx->key) {
-                memset(pipeline->transforms[i].ctx->key, 0, pipeline->transforms[i].ctx->key_len);
-                free(pipeline->transforms[i].ctx->key);
-                pipeline->transforms[i].ctx->key = NULL;
-            }
-            if (pipeline->transforms[i].ctx->iv) {
-                memset(pipeline->transforms[i].ctx->iv, 0, pipeline->transforms[i].ctx->iv_len);
-                free(pipeline->transforms[i].ctx->iv);
-                pipeline->transforms[i].ctx->iv = NULL;
-            }
-            if (pipeline->transforms[i].ctx->extra) {
-                free(pipeline->transforms[i].ctx->extra);
-                pipeline->transforms[i].ctx->extra = NULL;
-            }
-            free(pipeline->transforms[i].ctx);
-            pipeline->transforms[i].ctx = NULL;
-        }
+        free_transform_context(&pipeline->transforms[i]);
     }
 
     free(pipeline->transforms);
@@ -442,6 +448,53 @@ int cisv_transform_pipeline_add_by_name(
     if (field_index == -1) return -1;
 
     return cisv_transform_pipeline_add(pipeline, field_index, type, ctx);
+}
+
+int cisv_transform_pipeline_remove_field(
+    cisv_transform_pipeline_t *pipeline,
+    int field_index
+) {
+    if (!pipeline) return -1;
+
+    size_t write_idx = 0;
+    int removed = 0;
+
+    for (size_t read_idx = 0; read_idx < pipeline->count; read_idx++) {
+        cisv_transform_t *transform = &pipeline->transforms[read_idx];
+        if (transform->field_index == field_index) {
+            free_transform_context(transform);
+            removed++;
+            continue;
+        }
+
+        if (write_idx != read_idx) {
+            pipeline->transforms[write_idx] = pipeline->transforms[read_idx];
+        }
+        write_idx++;
+    }
+
+    if (removed > 0) {
+        memset(pipeline->transforms + write_idx, 0,
+               (pipeline->count - write_idx) * sizeof(cisv_transform_t));
+        pipeline->count = write_idx;
+        pipeline->index_dirty = 1;
+    }
+
+    return removed;
+}
+
+int cisv_transform_pipeline_remove_by_name(
+    cisv_transform_pipeline_t *pipeline,
+    const char *field_name
+) {
+    if (!pipeline || !field_name || !pipeline->header_fields) return -1;
+
+    int field_index = hash_table_lookup(pipeline, field_name);
+    if (field_index < 0) {
+        return 0;
+    }
+
+    return cisv_transform_pipeline_remove_field(pipeline, field_index);
 }
 
 // Helper to apply a single transform
