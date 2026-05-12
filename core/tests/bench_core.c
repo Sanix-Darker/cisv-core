@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,10 +21,11 @@ static void usage(const char *prog) {
             "  %s generate-json <path> <rows> <cols> <json-col>\n"
             "  %s parse <path>\n"
             "  %s count <path>\n"
+            "  %s iterator <path>\n"
             "  %s batch <path>\n"
             "  %s parallel <path> <threads>\n"
             "  %s writer <path> <rows> <field-len> <quote-period>\n",
-            prog, prog, prog, prog, prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int write_flat_dataset(const char *path, long rows, int cols) {
@@ -168,6 +170,56 @@ static int bench_writer(const char *path, long rows, size_t field_len, size_t qu
     return rc == 0 && close_rc == 0 ? 0 : 1;
 }
 
+static int bench_iterator(const char *path) {
+    cisv_config config;
+    cisv_config_init(&config);
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        fprintf(stderr, "iterator open failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    size_t rows = 0;
+    size_t fields_seen = 0;
+    size_t field_bytes = 0;
+
+    double t0 = now_seconds();
+    int rc = CISV_ITER_OK;
+    while ((rc = cisv_iterator_next(it, &fields, &lengths, &field_count)) == CISV_ITER_OK) {
+        if (fields_seen > SIZE_MAX - field_count) {
+            rc = CISV_ITER_ERROR;
+            break;
+        }
+        rows++;
+        fields_seen += field_count;
+        for (size_t i = 0; i < field_count; i++) {
+            if (field_bytes > SIZE_MAX - lengths[i]) {
+                rc = CISV_ITER_ERROR;
+                break;
+            }
+            field_bytes += lengths[i];
+        }
+        if (rc == CISV_ITER_ERROR) {
+            break;
+        }
+    }
+    double t1 = now_seconds();
+
+    cisv_iterator_close(it);
+
+    double seconds = t1 - t0;
+    double mib = (double)field_bytes / (1024.0 * 1024.0);
+    printf("mode=iterator rows=%zu fields=%zu field_bytes=%zu err=%d seconds=%.6f mib_per_sec=%.2f\n",
+           rows, fields_seen, field_bytes, rc == CISV_ITER_EOF ? 0 : 1, seconds,
+           seconds > 0.0 ? mib / seconds : 0.0);
+
+    return rc == CISV_ITER_EOF ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         usage(argv[0]);
@@ -220,6 +272,10 @@ int main(int argc, char **argv) {
         double t1 = now_seconds();
         printf("mode=count rows=%zu seconds=%.6f\n", rows, t1 - t0);
         return 0;
+    }
+
+    if (strcmp(argv[1], "iterator") == 0) {
+        return bench_iterator(argv[2]);
     }
 
     if (strcmp(argv[1], "batch") == 0) {
