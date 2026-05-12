@@ -574,6 +574,57 @@ void test_iterator_unterminated_quote_errors(void) {
     }
 }
 
+void test_iterator_cr_only_line_endings(void) {
+    TEST("iterator supports CR-only line endings");
+
+    const char *path = write_temp_csv("a,b\r\"line1\rline2\",c\r");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+
+    int rc1 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int first_ok = (rc1 == CISV_ITER_OK &&
+                    field_count == 2 &&
+                    strcmp(fields[0], "a") == 0 &&
+                    strcmp(fields[1], "b") == 0);
+
+    int rc2 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int second_ok = (rc2 == CISV_ITER_OK &&
+                     field_count == 2 &&
+                     lengths[0] == strlen("line1\rline2") &&
+                     memcmp(fields[0], "line1\rline2", lengths[0]) == 0 &&
+                     strcmp(fields[1], "c") == 0);
+
+    int rc3 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+
+    cisv_iterator_close(it);
+    unlink(path);
+
+    if (first_ok && second_ok && rc3 == CISV_ITER_EOF) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected two CR rows then EOF, got rc1=%d rc2=%d rc3=%d fields=%zu",
+                 rc1, rc2, rc3, field_count);
+        FAIL(buf);
+    }
+}
+
 void test_iterator_row_controls(void) {
     TEST("iterator respects comments and line ranges");
 
@@ -1493,6 +1544,34 @@ void test_parse_multiline_crlf(void) {
     }
 }
 
+void test_parse_cr_only_line_endings(void) {
+    TEST("CR-only row endings with quoted CR data");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *csv = "a,b\r\"line1\rline2\",c\r";
+    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (field_count == 4 && row_count == 2 &&
+        strcmp(stored_fields[2], "line1\rline2") == 0) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected 4 fields, 2 rows and quoted CR data; got %d fields, %d rows, field='%s'",
+                 field_count, row_count, describe_field(stored_fields[2]));
+        FAIL(buf);
+    }
+}
+
 void test_parse_multiline_empty_lines(void) {
     TEST("consecutive newlines inside quotes");
     reset_test_state();
@@ -1720,6 +1799,24 @@ void test_count_rows_final_row_without_newline(void) {
     }
 }
 
+void test_count_rows_cr_only_line_endings(void) {
+    TEST("count_rows supports CR-only line endings");
+
+    const char *path = write_temp_csv("a,b\r\"line1\rline2\",c\r");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_count_rows_empty_file(void) {
     TEST("count_rows empty file is zero");
 
@@ -1845,6 +1942,38 @@ void test_streaming_chunk_boundaries(void) {
     } else {
         char buf[128];
         snprintf(buf, sizeof(buf), "expected 4 fields/2 rows, got %d/%d", field_count, row_count);
+        FAIL(buf);
+    }
+}
+
+void test_streaming_split_crlf_boundaries(void) {
+    TEST("streaming parse coalesces split CRLF");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    cisv_parser_write(parser, (const uint8_t *)"a,b\r", 4);
+    cisv_parser_write(parser, (const uint8_t *)"\n1,2\r", 5);
+    cisv_parser_write(parser, (const uint8_t *)"\n", 1);
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (field_count == 4 && row_count == 2 &&
+        strcmp(stored_fields[0], "a") == 0 &&
+        strcmp(stored_fields[1], "b") == 0 &&
+        strcmp(stored_fields[2], "1") == 0 &&
+        strcmp(stored_fields[3], "2") == 0) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected split CRLF as 2 rows, got %d fields/%d rows",
+                 field_count, row_count);
         FAIL(buf);
     }
 }
@@ -2577,6 +2706,7 @@ int main(void) {
     test_iterator_custom_escape_eof_error();
     test_iterator_malformed_quote_errors();
     test_iterator_unterminated_quote_errors();
+    test_iterator_cr_only_line_endings();
     test_iterator_row_controls();
     test_iterator_skip_empty_and_quoted_comment_parity();
     test_parse_simple();
@@ -2612,6 +2742,7 @@ int main(void) {
     test_parse_multiline_multiple_fields();
     test_parse_multiline_escaped_quotes();
     test_parse_multiline_crlf();
+    test_parse_cr_only_line_endings();
     test_parse_multiline_empty_lines();
     test_parse_multiline_issue108();
     test_count_rows_with_config_custom_quote();
@@ -2621,11 +2752,13 @@ int main(void) {
     test_count_rows_skip_empty_preserves_empty_fields();
     test_count_rows_trimmed_comment_and_quoted_comment();
     test_count_rows_final_row_without_newline();
+    test_count_rows_cr_only_line_endings();
     test_count_rows_empty_file();
     test_count_rows_invalid_config_rejected();
     test_count_rows_malformed_quote_returns_zero();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
+    test_streaming_split_crlf_boundaries();
     test_streaming_rfc_quote_across_chunk_boundary();
     test_streaming_custom_escape_across_chunk_boundary();
     test_streaming_custom_escape_eof_error();
