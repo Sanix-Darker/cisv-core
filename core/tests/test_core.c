@@ -1267,6 +1267,42 @@ void test_count_rows_with_row_controls(void) {
     }
 }
 
+void test_count_rows_final_row_without_newline(void) {
+    TEST("count_rows final row without trailing newline");
+
+    const char *path = write_temp_csv("a,b\n1,2");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
+void test_count_rows_empty_file(void) {
+    TEST("count_rows empty file is zero");
+
+    const char *path = write_temp_csv("");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 0) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 0, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_parser_reuse_no_fd_leak(void) {
     TEST("parser reuse does not leak file descriptors");
 
@@ -1941,6 +1977,8 @@ int main(void) {
     test_count_rows_with_config_custom_quote();
     test_count_rows_with_escape_config();
     test_count_rows_with_row_controls();
+    test_count_rows_final_row_without_newline();
+    test_count_rows_empty_file();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
     test_streaming_rfc_quote_across_chunk_boundary();
