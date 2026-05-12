@@ -1267,6 +1267,77 @@ void test_count_rows_with_row_controls(void) {
     }
 }
 
+void test_count_rows_with_line_range_controls(void) {
+    TEST("count_rows_with_config respects line ranges");
+
+    const char *csv = "a\nb\nc\nd\n";
+    const char *path = write_temp_csv(csv);
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.from_line = 2;
+    config.to_line = 3;
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
+void test_count_rows_skip_empty_preserves_empty_fields(void) {
+    TEST("count_rows skip_empty keeps rows with empty fields");
+
+    const char *csv = "\n,,\n\"\"\n";
+    const char *path = write_temp_csv(csv);
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.skip_empty_lines = true;
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
+void test_count_rows_trimmed_comment_and_quoted_comment(void) {
+    TEST("count_rows trims comments but keeps quoted comment field");
+
+    const char *csv = "  #skip\n\"#keep\"\nvalue\n";
+    const char *path = write_temp_csv(csv);
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.comment = '#';
+    config.trim = true;
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_count_rows_final_row_without_newline(void) {
     TEST("count_rows final row without trailing newline");
 
@@ -2104,6 +2175,9 @@ int main(void) {
     test_count_rows_with_config_custom_quote();
     test_count_rows_with_escape_config();
     test_count_rows_with_row_controls();
+    test_count_rows_with_line_range_controls();
+    test_count_rows_skip_empty_preserves_empty_fields();
+    test_count_rows_trimmed_comment_and_quoted_comment();
     test_count_rows_final_row_without_newline();
     test_count_rows_empty_file();
     test_count_rows_invalid_config_rejected();

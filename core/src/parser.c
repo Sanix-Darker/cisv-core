@@ -1835,7 +1835,7 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                 }
                 i++;
             } else if (c == quote_char) {
-                if (escape_char == '\0' && i + 1 < size && data[i + 1] == quote_char) {
+                if (i + 1 < size && data[i + 1] == quote_char) {
                     i++;
                 } else {
                     in_quote = false;
@@ -1893,6 +1893,165 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
     return rows + (size > 0 && data[size - 1] != '\n');
 }
 
+typedef struct {
+    size_t rows;
+    size_t line_num;
+    bool row_has_field;
+    bool first_field_done;
+    bool row_is_comment;
+    bool trim;
+    bool skip_empty_lines;
+    uint8_t comment;
+    size_t from_line;
+    size_t to_line;
+} cisv_semantic_counter_t;
+
+static inline void count_finish_field(cisv_semantic_counter_t *counter,
+                                      const uint8_t *data, size_t start,
+                                      size_t end, bool quoted) {
+    if (!counter->first_field_done) {
+        if (!quoted && counter->comment != '\0') {
+            while (counter->trim && start < end && is_ws(data[start])) start++;
+            while (counter->trim && start < end && is_ws(data[end - 1])) end--;
+            counter->row_is_comment = (start < end && data[start] == counter->comment);
+        }
+        counter->first_field_done = true;
+    }
+    counter->row_has_field = true;
+}
+
+static inline void count_finish_row(cisv_semantic_counter_t *counter, bool empty_physical_row) {
+    counter->line_num++;
+    if (!counter->row_is_comment &&
+        !(counter->skip_empty_lines && empty_physical_row) &&
+        counter->line_num >= counter->from_line &&
+        (counter->to_line == 0 || counter->line_num <= counter->to_line)) {
+        counter->rows++;
+    }
+
+    counter->row_has_field = false;
+    counter->first_field_done = false;
+    counter->row_is_comment = false;
+}
+
+static size_t count_rows_semantic(const uint8_t *data, size_t size,
+                                  const cisv_config *config, bool *ok) {
+    cisv_semantic_counter_t counter = {
+        .trim = config->trim,
+        .skip_empty_lines = config->skip_empty_lines,
+        .comment = (uint8_t)config->comment,
+        .from_line = config->from_line > 0 ? (size_t)config->from_line : 1,
+        .to_line = config->to_line > 0 ? (size_t)config->to_line : 0,
+    };
+    uint8_t delimiter = (uint8_t)config->delimiter;
+    uint8_t quote_char = (uint8_t)config->quote;
+    uint8_t escape_char = (uint8_t)config->escape;
+    bool in_quote = false;
+    bool at_field_start = true;
+    bool after_quote = false;
+    bool current_field_quoted = false;
+    size_t field_start = 0;
+
+    *ok = true;
+
+    for (size_t i = 0; i < size; i++) {
+        uint8_t c = data[i];
+
+        if (in_quote) {
+            if (escape_char != '\0' && c == escape_char) {
+                if (i + 1 >= size) {
+                    *ok = false;
+                    return 0;
+                }
+                i++;
+            } else if (c == quote_char) {
+                if (i + 1 < size && data[i + 1] == quote_char) {
+                    i++;
+                } else {
+                    count_finish_field(&counter, data, field_start, i, true);
+                    in_quote = false;
+                    after_quote = true;
+                }
+            }
+            continue;
+        }
+
+        if (after_quote) {
+            if (c == ' ' || c == '\t') {
+                continue;
+            }
+            if (c == delimiter) {
+                after_quote = false;
+                at_field_start = true;
+                current_field_quoted = false;
+                field_start = i + 1;
+                continue;
+            }
+            if (c == '\n') {
+                count_finish_row(&counter, false);
+                after_quote = false;
+                at_field_start = true;
+                current_field_quoted = false;
+                field_start = i + 1;
+                continue;
+            }
+            if (c == '\r' && i + 1 < size && data[i + 1] == '\n') {
+                count_finish_row(&counter, false);
+                i++;
+                after_quote = false;
+                at_field_start = true;
+                current_field_quoted = false;
+                field_start = i + 1;
+                continue;
+            }
+
+            *ok = false;
+            return 0;
+        }
+
+        if (c == delimiter) {
+            count_finish_field(&counter, data, field_start, i, current_field_quoted);
+            at_field_start = true;
+            current_field_quoted = false;
+            field_start = i + 1;
+        } else if (c == '\n') {
+            size_t field_end = i;
+            if (field_end > field_start && data[field_end - 1] == '\r') {
+                field_end--;
+            }
+            bool empty_physical_row = !counter.row_has_field && field_start == field_end;
+            if (!(config->skip_empty_lines && empty_physical_row)) {
+                count_finish_field(&counter, data, field_start, field_end, current_field_quoted);
+            }
+            count_finish_row(&counter, empty_physical_row);
+            at_field_start = true;
+            current_field_quoted = false;
+            field_start = i + 1;
+        } else if (c == quote_char && at_field_start) {
+            in_quote = true;
+            at_field_start = false;
+            current_field_quoted = true;
+            field_start = i + 1;
+        } else {
+            at_field_start = false;
+        }
+    }
+
+    if (in_quote) {
+        *ok = false;
+        return 0;
+    }
+
+    if (after_quote) {
+        count_finish_row(&counter, false);
+    } else if (size > 0 && (field_start < size || counter.row_has_field)) {
+        count_finish_field(&counter, data, field_start, size, current_field_quoted);
+        count_finish_row(&counter, false);
+    }
+
+    return counter.rows;
+}
+
 static void row_count_cb(void *user) {
     cisv_row_counter_t *counter = (cisv_row_counter_t *)user;
     counter->rows++;
@@ -1917,15 +2076,18 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
     }
     if (!cisv_config_is_valid(&effective_config)) return 0;
 
-    bool fast_count_allowed =
+    bool simple_fast_count_allowed =
         !effective_config.skip_empty_lines &&
         effective_config.comment == 0 &&
         effective_config.from_line <= 1 &&
         effective_config.to_line == 0 &&
         effective_config.max_row_size == 0 &&
         !effective_config.skip_lines_with_error;
+    bool semantic_count_allowed =
+        effective_config.max_row_size == 0 &&
+        !effective_config.skip_lines_with_error;
 
-    int fd = fast_count_allowed ? open(path, O_RDONLY) : -1;
+    int fd = semantic_count_allowed ? open(path, O_RDONLY) : -1;
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
@@ -1935,25 +2097,29 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
 #endif
             uint8_t *base = (uint8_t *)mmap(NULL, st.st_size, PROT_READ, flags, fd, 0);
             if (base != MAP_FAILED) {
-                bool saw_quote = false;
-                size_t fast_count = count_newlines_fast(base, (size_t)st.st_size,
-                                                        (uint8_t)effective_config.quote, &saw_quote);
-                bool quoted_ok = false;
-                size_t quoted_count = 0;
-                if (saw_quote) {
-                    quoted_count = count_rows_quote_aware(base, (size_t)st.st_size,
-                                                          (uint8_t)effective_config.delimiter,
-                                                          (uint8_t)effective_config.quote,
-                                                          (uint8_t)effective_config.escape,
-                                                          &quoted_ok);
+                bool counted = false;
+                size_t count = 0;
+                if (simple_fast_count_allowed) {
+                    bool saw_quote = false;
+                    count = count_newlines_fast(base, (size_t)st.st_size,
+                                                (uint8_t)effective_config.quote, &saw_quote);
+                    if (!saw_quote) {
+                        counted = true;
+                    } else {
+                        count = count_rows_quote_aware(base, (size_t)st.st_size,
+                                                       (uint8_t)effective_config.delimiter,
+                                                       (uint8_t)effective_config.quote,
+                                                       (uint8_t)effective_config.escape,
+                                                       &counted);
+                    }
+                } else {
+                    count = count_rows_semantic(base, (size_t)st.st_size,
+                                                &effective_config, &counted);
                 }
                 munmap(base, st.st_size);
                 close(fd);
-                if (!saw_quote) {
-                    return fast_count;
-                }
-                if (quoted_ok) {
-                    return quoted_count;
+                if (counted) {
+                    return count;
                 }
                 fd = -1;
             }
