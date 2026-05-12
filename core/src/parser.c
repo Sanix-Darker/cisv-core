@@ -2834,6 +2834,7 @@ struct cisv_iterator {
     int state;                 // S_NORMAL, S_QUOTED
     char delimiter;
     char quote;
+    char escape;
     bool trim;
     bool skip_empty_lines;
     size_t max_row_size;
@@ -2980,6 +2981,10 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         errno = EINVAL;
         return NULL;
     }
+    if (config && !cisv_config_is_valid(config)) {
+        errno = EINVAL;
+        return NULL;
+    }
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -3004,6 +3009,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->eof = true;
         it->delimiter = config ? config->delimiter : ',';
         it->quote = config ? config->quote : '"';
+        it->escape = config ? config->escape : '\0';
         size_t memory_budget = cisv_runtime_memory_budget();
         size_t env_row_limit = cisv_runtime_max_row_size();
         it->max_row_size = config && config->max_row_size > 0
@@ -3045,6 +3051,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
     if (config) {
         it->delimiter = config->delimiter;
         it->quote = config->quote;
+        it->escape = config->escape;
         it->trim = config->trim;
         it->skip_empty_lines = config->skip_empty_lines;
         size_t memory_budget = cisv_runtime_memory_budget();
@@ -3055,6 +3062,7 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
     } else {
         it->delimiter = ',';
         it->quote = '"';
+        it->escape = '\0';
         it->trim = false;
         it->skip_empty_lines = false;
         it->max_row_size = cisv_adaptive_row_limit(cisv_runtime_memory_budget());
@@ -3169,7 +3177,18 @@ restart_row:
             }
         } else {
             // S_QUOTED state
-            if (c == it->quote) {
+            if (it->escape != '\0' && c == it->escape) {
+                if (it->pos + 1 >= it->end) {
+                    it->error_code = EINVAL;
+                    return CISV_ITER_ERROR;
+                }
+                if (!iter_ensure_quote_buffer(it, 1)) {
+                    if (it->error_code == 0) it->error_code = ENOMEM;
+                    return CISV_ITER_ERROR;
+                }
+                it->quote_buffer[it->quote_buffer_pos++] = *(it->pos + 1);
+                it->pos += 2;
+            } else if (c == it->quote) {
                 // Check for escaped quote
                 if (it->pos + 1 < it->end && *(it->pos + 1) == it->quote) {
                     // Escaped quote - add one quote to buffer

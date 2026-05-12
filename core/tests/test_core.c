@@ -393,6 +393,91 @@ void test_iterator_resource_row_limit(void) {
     }
 }
 
+void test_iterator_custom_escape_values(void) {
+    TEST("iterator custom escape preserves values");
+
+    const char *path = write_temp_csv("\"a\\\"b\",c\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    char first_field[32] = {0};
+    if (fields && field_count > 0) {
+        snprintf(first_field, sizeof(first_field), "%s", fields[0]);
+    }
+
+    int success = (rc == CISV_ITER_OK &&
+                   field_count == 2 &&
+                   lengths[0] == 3 &&
+                   strcmp(fields[0], "a\"b") == 0 &&
+                   strcmp(fields[1], "c") == 0);
+
+    cisv_iterator_close(it);
+    unlink(path);
+
+    if (success) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected escaped quote values, got rc=%d fields=%zu first='%s'",
+                 rc, field_count, first_field);
+        FAIL(buf);
+    }
+}
+
+void test_iterator_custom_escape_eof_error(void) {
+    TEST("iterator custom escape at EOF errors");
+
+    const char *path = write_temp_csv("\"a\\");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+
+    cisv_iterator_close(it);
+    unlink(path);
+
+    if (rc == CISV_ITER_ERROR) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected iterator error, got rc=%d fields=%zu", rc, field_count);
+        FAIL(buf);
+    }
+}
+
 // Test: Parse simple CSV string
 void test_parse_simple(void) {
     TEST("parse simple CSV");
@@ -1819,6 +1904,8 @@ int main(void) {
     test_gomemlimit_adaptive_row_limit();
     test_resource_env_max_procs_clamps_parallel();
     test_iterator_resource_row_limit();
+    test_iterator_custom_escape_values();
+    test_iterator_custom_escape_eof_error();
     test_parse_simple();
     test_parse_custom_delimiter();
     test_parse_quoted();
