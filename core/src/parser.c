@@ -492,6 +492,16 @@ static inline void parser_report_error(cisv_parser *p, int line, const char *msg
     }
 }
 
+static inline bool parser_quote_at_field_start(const cisv_parser *p, const uint8_t *ptr) {
+    return ptr == p->field_start && p->stream_buffer_pos == 0;
+}
+
+static inline void parser_report_bare_quote(cisv_parser *p, const uint8_t *ptr) {
+    if (!parser_quote_at_field_start(p, ptr) && !p->relaxed) {
+        parser_report_error(p, p->line_num + 1, "Quote inside unquoted field");
+    }
+}
+
 static inline bool row_in_emit_range(const cisv_parser *p) {
     int row_num = p->line_num + 1;
     return row_num >= p->from_line && (!p->to_line || row_num <= p->to_line);
@@ -1058,7 +1068,7 @@ static void parse_avx512(cisv_parser *p) {
                         p->field_start = ptr + 1;
                     }
                 } else if (quote_mask & (1ULL << pos)) {
-                    if (ptr == p->field_start) {
+                    if (parser_quote_at_field_start(p, ptr)) {
                         p->state = S_QUOTED;
                         p->cur = ptr + 1;
                         p->quote_buffer_pos = 0;
@@ -1068,6 +1078,8 @@ static void parse_avx512(cisv_parser *p) {
                         p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
+                    } else {
+                        parser_report_bare_quote(p, ptr);
                     }
                 }
 
@@ -1105,14 +1117,19 @@ static void parse_avx512(cisv_parser *p) {
                     mark_streaming_split_cr(p, p->cur);
                 }
                 p->field_start = p->cur;
-            } else if (c == p->quote && p->cur - 1 == p->field_start) {
-                p->state = S_QUOTED;
-                p->quote_buffer_pos = 0;
-                p->quoted_field_start = p->cur;
-                p->quoted_field_buffered = false;
-                p->quoted_pending_quote = false;
-                p->quoted_pending_escape = false;
-                consume_quoted_field(p);
+            } else if (c == p->quote) {
+                const uint8_t *ptr = p->cur - 1;
+                if (parser_quote_at_field_start(p, ptr)) {
+                    p->state = S_QUOTED;
+                    p->quote_buffer_pos = 0;
+                    p->quoted_field_start = p->cur;
+                    p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
+                    consume_quoted_field(p);
+                } else {
+                    parser_report_bare_quote(p, ptr);
+                }
             }
         } else if (p->state == S_QUOTED) {
             p->cur--;
@@ -1198,7 +1215,7 @@ static void parse_avx2(cisv_parser *p) {
                         p->field_start = ptr + 1;
                     }
                 } else if (c == p->quote) {
-                    if (ptr == p->field_start) {
+                    if (parser_quote_at_field_start(p, ptr)) {
                         p->state = S_QUOTED;
                         p->cur = ptr + 1;
                         p->quote_buffer_pos = 0;
@@ -1208,6 +1225,8 @@ static void parse_avx2(cisv_parser *p) {
                         p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
+                    } else {
+                        parser_report_bare_quote(p, ptr);
                     }
                 }
 
@@ -1245,14 +1264,19 @@ static void parse_avx2(cisv_parser *p) {
                     mark_streaming_split_cr(p, p->cur);
                 }
                 p->field_start = p->cur;
-            } else if (c == p->quote && p->cur - 1 == p->field_start) {
-                p->state = S_QUOTED;
-                p->quote_buffer_pos = 0;
-                p->quoted_field_start = p->cur;
-                p->quoted_field_buffered = false;
-                p->quoted_pending_quote = false;
-                p->quoted_pending_escape = false;
-                consume_quoted_field(p);
+            } else if (c == p->quote) {
+                const uint8_t *ptr = p->cur - 1;
+                if (parser_quote_at_field_start(p, ptr)) {
+                    p->state = S_QUOTED;
+                    p->quote_buffer_pos = 0;
+                    p->quoted_field_start = p->cur;
+                    p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
+                    consume_quoted_field(p);
+                } else {
+                    parser_report_bare_quote(p, ptr);
+                }
             }
         } else if (p->state == S_QUOTED) {
             p->cur--;
@@ -1348,16 +1372,21 @@ static void parse_neon(cisv_parser *p) {
                         mark_streaming_split_cr(p, p->cur);
                     }
                     p->field_start = p->cur;
-                } else if (c == p->quote && p->cur == p->field_start) {
-                    p->state = S_QUOTED;
+                } else if (c == p->quote) {
+                    if (parser_quote_at_field_start(p, p->cur)) {
+                        p->state = S_QUOTED;
+                        p->cur++;
+                        p->quote_buffer_pos = 0;
+                        p->quoted_field_start = p->cur;
+                        p->quoted_field_buffered = false;
+                        p->quoted_pending_quote = false;
+                        p->quoted_pending_escape = false;
+                        consume_quoted_field(p);
+                        break;
+                    }
+                    parser_report_bare_quote(p, p->cur);
                     p->cur++;
-                    p->quote_buffer_pos = 0;
-                    p->quoted_field_start = p->cur;
-                    p->quoted_field_buffered = false;
-                    p->quoted_pending_quote = false;
-                    p->quoted_pending_escape = false;
-                    consume_quoted_field(p);
-                    break;
+                    if (p->cur >= p->field_start + 16) break;
                 } else {
                     p->cur++;
                     if (p->cur >= p->field_start + 16) break;
@@ -1394,14 +1423,19 @@ static void parse_neon(cisv_parser *p) {
                     mark_streaming_split_cr(p, p->cur);
                 }
                 p->field_start = p->cur;
-            } else if (c == p->quote && p->cur - 1 == p->field_start) {
-                p->state = S_QUOTED;
-                p->quote_buffer_pos = 0;
-                p->quoted_field_start = p->cur;
-                p->quoted_field_buffered = false;
-                p->quoted_pending_quote = false;
-                p->quoted_pending_escape = false;
-                consume_quoted_field(p);
+            } else if (c == p->quote) {
+                const uint8_t *ptr = p->cur - 1;
+                if (parser_quote_at_field_start(p, ptr)) {
+                    p->state = S_QUOTED;
+                    p->quote_buffer_pos = 0;
+                    p->quoted_field_start = p->cur;
+                    p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
+                    consume_quoted_field(p);
+                } else {
+                    parser_report_bare_quote(p, ptr);
+                }
             }
         } else if (p->state == S_QUOTED) {
             p->cur--;
@@ -1484,7 +1518,7 @@ static void parse_sse2(cisv_parser *p) {
                         p->field_start = ptr + 1;
                     }
                 } else if (c == p->quote) {
-                    if (ptr == p->field_start) {
+                    if (parser_quote_at_field_start(p, ptr)) {
                         p->state = S_QUOTED;
                         p->cur = ptr + 1;
                         p->quote_buffer_pos = 0;
@@ -1494,6 +1528,8 @@ static void parse_sse2(cisv_parser *p) {
                         p->quoted_pending_escape = false;
                         consume_quoted_field(p);
                         break;
+                    } else {
+                        parser_report_bare_quote(p, ptr);
                     }
                 }
 
@@ -1531,14 +1567,19 @@ static void parse_sse2(cisv_parser *p) {
                     mark_streaming_split_cr(p, p->cur);
                 }
                 p->field_start = p->cur;
-            } else if (c == p->quote && p->cur - 1 == p->field_start) {
-                p->state = S_QUOTED;
-                p->quote_buffer_pos = 0;
-                p->quoted_field_start = p->cur;
-                p->quoted_field_buffered = false;
-                p->quoted_pending_quote = false;
-                p->quoted_pending_escape = false;
-                consume_quoted_field(p);
+            } else if (c == p->quote) {
+                const uint8_t *ptr = p->cur - 1;
+                if (parser_quote_at_field_start(p, ptr)) {
+                    p->state = S_QUOTED;
+                    p->quote_buffer_pos = 0;
+                    p->quoted_field_start = p->cur;
+                    p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
+                    consume_quoted_field(p);
+                } else {
+                    parser_report_bare_quote(p, ptr);
+                }
             }
         } else if (p->state == S_QUOTED) {
             p->cur--;
@@ -1612,16 +1653,20 @@ static void parse_scalar(cisv_parser *p) {
                         mark_streaming_split_cr(p, p->cur);
                     }
                     p->field_start = p->cur;
-                } else if (c == p->quote && p->cur == p->field_start) {
-                    p->state = S_QUOTED;
+                } else if (c == p->quote) {
+                    if (parser_quote_at_field_start(p, p->cur)) {
+                        p->state = S_QUOTED;
+                        p->cur++;
+                        p->quote_buffer_pos = 0;
+                        p->quoted_field_start = p->cur;
+                        p->quoted_field_buffered = false;
+                        p->quoted_pending_quote = false;
+                        p->quoted_pending_escape = false;
+                        consume_quoted_field(p);
+                        break;
+                    }
+                    parser_report_bare_quote(p, p->cur);
                     p->cur++;
-                    p->quote_buffer_pos = 0;
-                    p->quoted_field_start = p->cur;
-                    p->quoted_field_buffered = false;
-                    p->quoted_pending_quote = false;
-                    p->quoted_pending_escape = false;
-                    consume_quoted_field(p);
-                    break;
                 } else {
                     p->cur++;
                 }
@@ -1657,14 +1702,19 @@ static void parse_scalar(cisv_parser *p) {
                     mark_streaming_split_cr(p, p->cur);
                 }
                 p->field_start = p->cur;
-            } else if (c == p->quote && p->cur - 1 == p->field_start) {
-                p->state = S_QUOTED;
-                p->quote_buffer_pos = 0;
-                p->quoted_field_start = p->cur;
-                p->quoted_field_buffered = false;
-                p->quoted_pending_quote = false;
-                p->quoted_pending_escape = false;
-                consume_quoted_field(p);
+            } else if (c == p->quote) {
+                const uint8_t *ptr = p->cur - 1;
+                if (parser_quote_at_field_start(p, ptr)) {
+                    p->state = S_QUOTED;
+                    p->quote_buffer_pos = 0;
+                    p->quoted_field_start = p->cur;
+                    p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
+                    p->quoted_pending_escape = false;
+                    consume_quoted_field(p);
+                } else {
+                    parser_report_bare_quote(p, ptr);
+                }
             }
         } else if (p->state == S_QUOTED) {
             p->cur--;
@@ -2023,7 +2073,7 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
 
 static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                                      uint8_t delimiter, uint8_t quote_char,
-                                     uint8_t escape_char, bool *ok) {
+                                     uint8_t escape_char, bool relaxed, bool *ok) {
     size_t rows = 0;
     bool in_quote = false;
     bool at_field_start = true;
@@ -2077,8 +2127,13 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                 continue;
             }
 
-            *ok = false;
-            return 0;
+            if (!relaxed) {
+                *ok = false;
+                return 0;
+            }
+            after_quote = false;
+            at_field_start = false;
+            continue;
         }
 
         if (c == delimiter) {
@@ -2092,9 +2147,14 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                 i++;
             }
             at_field_start = true;
-        } else if (c == quote_char && at_field_start) {
-            in_quote = true;
-            at_field_start = false;
+        } else if (c == quote_char) {
+            if (at_field_start) {
+                in_quote = true;
+                at_field_start = false;
+            } else if (!relaxed) {
+                *ok = false;
+                return 0;
+            }
         } else {
             at_field_start = false;
         }
@@ -2222,8 +2282,15 @@ static size_t count_rows_semantic(const uint8_t *data, size_t size,
                 continue;
             }
 
-            *ok = false;
-            return 0;
+            if (!config->relaxed) {
+                *ok = false;
+                return 0;
+            }
+            after_quote = false;
+            at_field_start = false;
+            current_field_quoted = false;
+            field_start = i;
+            continue;
         }
 
         if (c == delimiter) {
@@ -2257,11 +2324,18 @@ static size_t count_rows_semantic(const uint8_t *data, size_t size,
             at_field_start = true;
             current_field_quoted = false;
             field_start = i + 1;
-        } else if (c == quote_char && at_field_start) {
-            in_quote = true;
-            at_field_start = false;
-            current_field_quoted = true;
-            field_start = i + 1;
+        } else if (c == quote_char) {
+            if (at_field_start) {
+                in_quote = true;
+                at_field_start = false;
+                current_field_quoted = true;
+                field_start = i + 1;
+            } else if (!config->relaxed) {
+                *ok = false;
+                return 0;
+            } else {
+                at_field_start = false;
+            }
         } else {
             at_field_start = false;
         }
@@ -2340,6 +2414,7 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
                                                        (uint8_t)effective_config.delimiter,
                                                        (uint8_t)effective_config.quote,
                                                        (uint8_t)effective_config.escape,
+                                                       effective_config.relaxed,
                                                        &counted);
                     }
                 } else {
@@ -3789,14 +3864,21 @@ restart_row:
                 }
                 return finished;
 
-            } else if (c == it->quote && it->pos == field_start) {
-                // Start of quoted field
-                if (it->field_count == 0) {
-                    it->first_field_quoted = true;
+            } else if (c == it->quote) {
+                if (it->pos == field_start) {
+                    // Start of quoted field
+                    if (it->field_count == 0) {
+                        it->first_field_quoted = true;
+                    }
+                    it->state = S_QUOTED;
+                    it->quote_buffer_pos = 0;
+                    it->pos++;
+                } else if (!it->relaxed) {
+                    it->error_code = EINVAL;
+                    return CISV_ITER_ERROR;
+                } else {
+                    it->pos++;
                 }
-                it->state = S_QUOTED;
-                it->quote_buffer_pos = 0;
-                it->pos++;
             } else {
                 it->pos++;
             }

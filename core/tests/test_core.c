@@ -526,6 +526,60 @@ void test_iterator_malformed_quote_errors(void) {
     }
 }
 
+void test_iterator_bare_quote_strict_and_relaxed(void) {
+    TEST("iterator bare quote strict error and relaxed literal");
+
+    const char *path = write_temp_csv("a\"b,c\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count_local = 0;
+    int strict_rc = cisv_iterator_next(it, &fields, &lengths, &field_count_local);
+    cisv_iterator_close(it);
+
+    config.relaxed = true;
+    it = cisv_iterator_open(path, &config);
+    int relaxed_rc = CISV_ITER_ERROR;
+    size_t relaxed_fields = 0;
+    char first_field[16] = {0};
+    if (it) {
+        relaxed_rc = cisv_iterator_next(it, &fields, &lengths, &relaxed_fields);
+        if (relaxed_rc == CISV_ITER_OK && relaxed_fields > 0 && lengths[0] < sizeof(first_field)) {
+            memcpy(first_field, fields[0], lengths[0]);
+            first_field[lengths[0]] = '\0';
+        }
+        cisv_iterator_close(it);
+    }
+
+    unlink(path);
+
+    if (strict_rc == CISV_ITER_ERROR &&
+        relaxed_rc == CISV_ITER_OK &&
+        relaxed_fields == 2 &&
+        strcmp(first_field, "a\"b") == 0) {
+        PASS();
+    } else {
+        char buf[180];
+        snprintf(buf, sizeof(buf), "expected strict error and relaxed [a\\\"b,c], got strict=%d relaxed=%d fields=%zu first='%s'",
+                 strict_rc, relaxed_rc, relaxed_fields, first_field);
+        FAIL(buf);
+    }
+}
+
 void test_iterator_unterminated_quote_errors(void) {
     TEST("iterator strict unterminated quote errors");
 
@@ -837,13 +891,14 @@ void test_parse_quoted(void) {
 }
 
 void test_parse_quote_inside_unquoted_field(void) {
-    TEST("literal quote inside unquoted field");
+    TEST("quote inside unquoted field strict error and relaxed literal");
     reset_test_state();
 
     cisv_config config;
     cisv_config_init(&config);
     config.field_cb = test_field_cb;
     config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
 
     cisv_parser *parser = cisv_parser_create_with_config(&config);
     if (!parser) {
@@ -851,18 +906,41 @@ void test_parse_quote_inside_unquoted_field(void) {
         return;
     }
 
-    const char *csv = "a\"b\",c\n";
-    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    const char *strict_csv = "a\"b,c\n";
+    int strict_rc = cisv_parser_write(parser, (const uint8_t *)strict_csv, strlen(strict_csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+    int strict_errors = error_count;
+
+    reset_test_state();
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+    config.relaxed = true;
+
+    parser = cisv_parser_create_with_config(&config);
+    if (!parser) {
+        FAIL("failed to create relaxed parser");
+        return;
+    }
+
+    const char *relaxed_csv = "a\"b\",c\n";
+    int relaxed_rc = cisv_parser_write(parser, (const uint8_t *)relaxed_csv, strlen(relaxed_csv));
     cisv_parser_end(parser);
     cisv_parser_destroy(parser);
 
-    if (field_count == 2 && row_count == 1 &&
+    if (strict_rc < 0 && strict_errors == 1 &&
+        relaxed_rc == 0 &&
+        field_count == 2 && row_count == 1 &&
         strcmp(stored_fields[0], "a\"b\"") == 0 &&
         strcmp(stored_fields[1], "c") == 0) {
         PASS();
     } else {
-        char buf[160];
-        snprintf(buf, sizeof(buf), "expected [a\\\"b\\\", c], got fields=%d rows=%d", field_count, row_count);
+        char buf[220];
+        snprintf(buf, sizeof(buf),
+                 "expected strict error and relaxed [a\\\"b\\\", c], got strict_rc=%d strict_errors=%d relaxed_rc=%d fields=%d rows=%d",
+                 strict_rc, strict_errors, relaxed_rc, field_count, row_count);
         FAIL(buf);
     }
 }
@@ -1894,6 +1972,31 @@ void test_count_rows_malformed_quote_returns_zero(void) {
     }
 }
 
+void test_count_rows_bare_quote_strict_and_relaxed(void) {
+    TEST("count_rows bare quote strict error and relaxed count");
+
+    const char *path = write_temp_csv("a,b\n1\"x,2\n");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t strict_count = cisv_parser_count_rows(path);
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.relaxed = true;
+    size_t relaxed_count = cisv_parser_count_rows_with_config(path, &config);
+
+    unlink(path);
+
+    if (strict_count == 0 && relaxed_count == 2) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected strict=0 relaxed=2, got strict=%zu relaxed=%zu",
+                 strict_count, relaxed_count);
+        FAIL(buf);
+    }
+}
+
 void test_parser_reuse_no_fd_leak(void) {
     TEST("parser reuse does not leak file descriptors");
 
@@ -2778,6 +2881,7 @@ int main(void) {
     test_iterator_custom_escape_values();
     test_iterator_custom_escape_eof_error();
     test_iterator_malformed_quote_errors();
+    test_iterator_bare_quote_strict_and_relaxed();
     test_iterator_unterminated_quote_errors();
     test_iterator_cr_only_line_endings();
     test_iterator_row_controls();
@@ -2830,6 +2934,7 @@ int main(void) {
     test_count_rows_empty_file();
     test_count_rows_invalid_config_rejected();
     test_count_rows_malformed_quote_returns_zero();
+    test_count_rows_bare_quote_strict_and_relaxed();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
     test_streaming_split_crlf_boundaries();
