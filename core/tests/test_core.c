@@ -478,6 +478,119 @@ void test_iterator_custom_escape_eof_error(void) {
     }
 }
 
+void test_iterator_row_controls(void) {
+    TEST("iterator respects comments and line ranges");
+
+    const char *path = write_temp_csv("  #skip\nid,msg\n1,\"hello \\\"quoted\\\"\"\n2,tail\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+    config.comment = '#';
+    config.trim = true;
+    config.from_line = 1;
+    config.to_line = 3;
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc1 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int first_ok = (rc1 == CISV_ITER_OK &&
+                    field_count == 2 &&
+                    strcmp(fields[0], "id") == 0 &&
+                    strcmp(fields[1], "msg") == 0);
+
+    int rc2 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int second_ok = (rc2 == CISV_ITER_OK &&
+                     field_count == 2 &&
+                     lengths[1] == 14 &&
+                     strcmp(fields[0], "1") == 0 &&
+                     strcmp(fields[1], "hello \"quoted\"") == 0);
+
+    int rc3 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+
+    cisv_iterator_close(it);
+    unlink(path);
+
+    if (first_ok && second_ok && rc3 == CISV_ITER_EOF) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected two filtered rows then EOF, got rc1=%d rc2=%d rc3=%d fields=%zu",
+                 rc1, rc2, rc3, field_count);
+        FAIL(buf);
+    }
+}
+
+void test_iterator_skip_empty_and_quoted_comment_parity(void) {
+    TEST("iterator skip_empty keeps quoted empty and quoted comment rows");
+
+    const char *path = write_temp_csv("\n\"\"\n#skip\n\"#keep\"\n,,\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.comment = '#';
+    config.skip_empty_lines = true;
+
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+
+    int rc1 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int first_ok = (rc1 == CISV_ITER_OK &&
+                    field_count == 1 &&
+                    lengths[0] == 0 &&
+                    strcmp(fields[0], "") == 0);
+
+    int rc2 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int second_ok = (rc2 == CISV_ITER_OK &&
+                     field_count == 1 &&
+                     strcmp(fields[0], "#keep") == 0);
+
+    int rc3 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    int third_ok = (rc3 == CISV_ITER_OK &&
+                    field_count == 3 &&
+                    lengths[0] == 0 &&
+                    lengths[1] == 0 &&
+                    lengths[2] == 0);
+
+    int rc4 = cisv_iterator_next(it, &fields, &lengths, &field_count);
+
+    cisv_iterator_close(it);
+    unlink(path);
+
+    if (first_ok && second_ok && third_ok && rc4 == CISV_ITER_EOF) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected quoted empty/comment and empty fields, got rc1=%d rc2=%d rc3=%d rc4=%d",
+                 rc1, rc2, rc3, rc4);
+        FAIL(buf);
+    }
+}
+
 // Test: Parse simple CSV string
 void test_parse_simple(void) {
     TEST("parse simple CSV");
@@ -2295,6 +2408,8 @@ int main(void) {
     test_iterator_resource_row_limit();
     test_iterator_custom_escape_values();
     test_iterator_custom_escape_eof_error();
+    test_iterator_row_controls();
+    test_iterator_skip_empty_and_quoted_comment_parity();
     test_parse_simple();
     test_parse_custom_delimiter();
     test_parse_quoted();

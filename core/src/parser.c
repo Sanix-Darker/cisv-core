@@ -3114,6 +3114,11 @@ struct cisv_iterator {
     char escape;
     bool trim;
     bool skip_empty_lines;
+    char comment;
+    size_t from_line;
+    size_t to_line;
+    size_t line_num;
+    bool first_field_quoted;
     size_t max_row_size;
     size_t current_row_size;
 
@@ -3126,6 +3131,24 @@ struct cisv_iterator {
     bool eof;
     int error_code;
 };
+
+#define ITER_ROW_SKIP 1
+
+static inline void iter_clear_row(cisv_iterator_t *it) {
+    it->field_count = 0;
+    it->field_data_len = 0;
+    it->current_row_size = 0;
+    it->quote_buffer_pos = 0;
+    it->first_field_quoted = false;
+}
+
+static inline void iter_set_empty_output(const char ***fields,
+                                         const size_t **lengths,
+                                         size_t *field_count) {
+    if (fields) *fields = NULL;
+    if (lengths) *lengths = NULL;
+    if (field_count) *field_count = 0;
+}
 
 // Ensure iterator has capacity for more fields
 static inline bool iter_ensure_fields(cisv_iterator_t *it, size_t needed) {
@@ -3287,6 +3310,11 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->delimiter = config ? config->delimiter : ',';
         it->quote = config ? config->quote : '"';
         it->escape = config ? config->escape : '\0';
+        it->trim = config ? config->trim : false;
+        it->skip_empty_lines = config ? config->skip_empty_lines : false;
+        it->comment = config ? config->comment : '\0';
+        it->from_line = config && config->from_line > 0 ? (size_t)config->from_line : 1;
+        it->to_line = config && config->to_line > 0 ? (size_t)config->to_line : 0;
         size_t memory_budget = cisv_runtime_memory_budget();
         size_t env_row_limit = cisv_runtime_max_row_size();
         it->max_row_size = config && config->max_row_size > 0
@@ -3331,6 +3359,9 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->escape = config->escape;
         it->trim = config->trim;
         it->skip_empty_lines = config->skip_empty_lines;
+        it->comment = config->comment;
+        it->from_line = config->from_line > 0 ? (size_t)config->from_line : 1;
+        it->to_line = config->to_line > 0 ? (size_t)config->to_line : 0;
         size_t memory_budget = cisv_runtime_memory_budget();
         size_t env_row_limit = cisv_runtime_max_row_size();
         it->max_row_size = config->max_row_size > 0
@@ -3342,6 +3373,9 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->escape = '\0';
         it->trim = false;
         it->skip_empty_lines = false;
+        it->comment = '\0';
+        it->from_line = 1;
+        it->to_line = 0;
         it->max_row_size = cisv_adaptive_row_limit(cisv_runtime_memory_budget());
     }
 
@@ -3369,28 +3403,57 @@ static inline void iter_trim_field(const uint8_t **start, const uint8_t **end) {
     while (*start < *end && is_ws(*(*end - 1))) (*end)--;
 }
 
+static inline int iter_finish_row(cisv_iterator_t *it,
+                                  const char ***fields,
+                                  const size_t **lengths,
+                                  size_t *field_count) {
+    it->line_num++;
+
+    if (it->to_line != 0 && it->line_num > it->to_line) {
+        it->eof = true;
+        iter_set_empty_output(fields, lengths, field_count);
+        return CISV_ITER_EOF;
+    }
+
+    bool empty_row = it->field_count == 1 &&
+                     it->lengths[0] == 0 &&
+                     !it->first_field_quoted;
+    bool comment_row = it->comment != '\0' &&
+                       !it->first_field_quoted &&
+                       it->field_count > 0 &&
+                       it->lengths[0] > 0 &&
+                       it->fields[0][0] == it->comment;
+
+    if ((it->skip_empty_lines && empty_row) ||
+        comment_row ||
+        it->line_num < it->from_line) {
+        iter_clear_row(it);
+        return ITER_ROW_SKIP;
+    }
+
+    if (fields) *fields = (const char **)it->fields;
+    if (lengths) *lengths = it->lengths;
+    if (field_count) *field_count = it->field_count;
+    it->first_field_quoted = false;
+    return CISV_ITER_OK;
+}
+
 int cisv_iterator_next(cisv_iterator_t *it,
                        const char ***fields,
                        const size_t **lengths,
                        size_t *field_count) {
     if (!it || it->eof) {
-        if (fields) *fields = NULL;
-        if (lengths) *lengths = NULL;
-        if (field_count) *field_count = 0;
+        iter_set_empty_output(fields, lengths, field_count);
         return CISV_ITER_EOF;
     }
 
     // Reset row state
-    it->field_count = 0;
-    it->field_data_len = 0;
-    it->current_row_size = 0;
+    iter_clear_row(it);
 
 restart_row:
     if (it->pos >= it->end) {
         it->eof = true;
-        if (fields) *fields = NULL;
-        if (lengths) *lengths = NULL;
-        if (field_count) *field_count = 0;
+        iter_set_empty_output(fields, lengths, field_count);
         return CISV_ITER_EOF;
     }
 
@@ -3430,22 +3493,17 @@ restart_row:
                 }
                 it->pos++;
 
-                // Skip empty rows if configured
-                if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
-                    it->field_count = 0;
-                    it->field_data_len = 0;
-                    it->current_row_size = 0;
+                int finished = iter_finish_row(it, fields, lengths, field_count);
+                if (finished == ITER_ROW_SKIP) {
                     goto restart_row;
                 }
-
-                // Success - row complete
-                if (fields) *fields = (const char **)it->fields;
-                if (lengths) *lengths = it->lengths;
-                if (field_count) *field_count = it->field_count;
-                return CISV_ITER_OK;
+                return finished;
 
             } else if (c == it->quote && it->pos == field_start) {
                 // Start of quoted field
+                if (it->field_count == 0) {
+                    it->first_field_quoted = true;
+                }
                 it->state = S_QUOTED;
                 it->quote_buffer_pos = 0;
                 it->pos++;
@@ -3502,35 +3560,19 @@ restart_row:
                         } else if (*it->pos == '\n') {
                             it->pos++;
 
-                            // Skip empty rows if configured
-                            if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
-                                it->field_count = 0;
-                                it->field_data_len = 0;
-                                it->current_row_size = 0;
+                            int finished = iter_finish_row(it, fields, lengths, field_count);
+                            if (finished == ITER_ROW_SKIP) {
                                 goto restart_row;
                             }
-
-                            // Success - row complete
-                            if (fields) *fields = (const char **)it->fields;
-                            if (lengths) *lengths = it->lengths;
-                            if (field_count) *field_count = it->field_count;
-                            return CISV_ITER_OK;
+                            return finished;
                         } else if (*it->pos == '\r' && it->pos + 1 < it->end && *(it->pos + 1) == '\n') {
                             it->pos += 2;
 
-                            // Skip empty rows if configured
-                            if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
-                                it->field_count = 0;
-                                it->field_data_len = 0;
-                                it->current_row_size = 0;
+                            int finished = iter_finish_row(it, fields, lengths, field_count);
+                            if (finished == ITER_ROW_SKIP) {
                                 goto restart_row;
                             }
-
-                            // Success - row complete
-                            if (fields) *fields = (const char **)it->fields;
-                            if (lengths) *lengths = it->lengths;
-                            if (field_count) *field_count = it->field_count;
-                            return CISV_ITER_OK;
+                            return finished;
                         }
                     }
                     field_start = it->pos;
@@ -3580,26 +3622,18 @@ restart_row:
         }
     }
 
-    it->eof = true;
-
-    // Skip empty final row if configured
-    if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
-        if (fields) *fields = NULL;
-        if (lengths) *lengths = NULL;
-        if (field_count) *field_count = 0;
-        return CISV_ITER_EOF;
-    }
-
     if (it->field_count > 0) {
-        if (fields) *fields = (const char **)it->fields;
-        if (lengths) *lengths = it->lengths;
-        if (field_count) *field_count = it->field_count;
-        return CISV_ITER_OK;
+        int finished = iter_finish_row(it, fields, lengths, field_count);
+        it->eof = true;
+        if (finished == ITER_ROW_SKIP) {
+            iter_set_empty_output(fields, lengths, field_count);
+            return CISV_ITER_EOF;
+        }
+        return finished;
     }
 
-    if (fields) *fields = NULL;
-    if (lengths) *lengths = NULL;
-    if (field_count) *field_count = 0;
+    it->eof = true;
+    iter_set_empty_output(fields, lengths, field_count);
     return CISV_ITER_EOF;
 }
 
