@@ -1810,6 +1810,92 @@ void test_parallel_custom_quote_chunk_split(void) {
     }
 }
 
+void test_parallel_custom_escape_chunk_split(void) {
+    TEST("parallel parse uses custom escape in chunk splitting");
+
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_cisv_parallel_escape_%d.csv", getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    fprintf(f, "id,text,flag\n");
+    fprintf(f, "0,\"");
+    for (int i = 0; i < 4500; i++) {
+        fputc('a', f);
+    }
+    fprintf(f, "\\\"");
+    for (int i = 0; i < 500; i++) {
+        fputc('b', f);
+    }
+    fputc('\n', f);
+    for (int i = 0; i < 300; i++) {
+        fputc('c', f);
+    }
+    fprintf(f, "\",ok\n");
+
+    for (int i = 1; i <= 260; i++) {
+        fprintf(f, "%d,value,ok\n", i);
+    }
+    fclose(f);
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+
+    int result_count = 0;
+    cisv_result_t **results = cisv_parse_file_parallel(path, &config, 2, &result_count);
+    if (!results || result_count <= 0) {
+        unlink(path);
+        FAIL("parallel parse failed");
+        return;
+    }
+
+    size_t total_rows = 0;
+    size_t total_fields = 0;
+    int found_multiline = 0;
+    int had_error = 0;
+
+    for (int i = 0; i < result_count; i++) {
+        cisv_result_t *r = results[i];
+        if (!r) {
+            had_error = 1;
+            continue;
+        }
+        if (r->error_code != 0) {
+            had_error = 1;
+        }
+        total_rows += r->row_count;
+        total_fields += r->total_fields;
+
+        for (size_t row_idx = 0; row_idx < r->row_count; row_idx++) {
+            cisv_row_t *row = &r->rows[row_idx];
+            for (size_t col = 0; col < row->field_count; col++) {
+                if (row->field_lengths[col] == 5302 &&
+                    memchr(row->fields[col], '\n', row->field_lengths[col]) &&
+                    memchr(row->fields[col], '"', row->field_lengths[col])) {
+                    found_multiline = 1;
+                }
+            }
+        }
+    }
+
+    cisv_results_free(results, result_count);
+    unlink(path);
+
+    if (!had_error && total_rows == 262 && total_fields == 786 && found_multiline) {
+        PASS();
+    } else {
+        char buf[220];
+        snprintf(buf, sizeof(buf),
+                 "expected rows=262 fields=786 multiline=1, got rows=%zu fields=%zu multiline=%d error=%d",
+                 total_rows, total_fields, found_multiline, had_error);
+        FAIL(buf);
+    }
+}
+
 void test_wide_multiline_json_stress(void) {
     TEST("wide multiline JSON stress");
 
@@ -1992,6 +2078,7 @@ int main(void) {
     test_parse_comment_lines();
     test_max_row_size_skip_error_lines();
     test_parallel_custom_quote_chunk_split();
+    test_parallel_custom_escape_chunk_split();
     test_wide_multiline_json_stress();
 
     // Summary

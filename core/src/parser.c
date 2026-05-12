@@ -2037,7 +2037,8 @@ static cisv_chunk_t *split_chunks_with_quote(
     const cisv_mmap_file_t *file,
     int num_chunks,
     int *chunk_count,
-    char quote_char
+    char quote_char,
+    char escape_char
 ) {
     if (!file || !file->data || num_chunks <= 0 || !chunk_count) {
         return NULL;
@@ -2073,6 +2074,11 @@ static cisv_chunk_t *split_chunks_with_quote(
                 continue;
             }
             in_quote = !in_quote;
+        } else if (in_quote && escape_char != '\0' && c == (uint8_t)escape_char) {
+            if (scan + 1 < end) {
+                scan += 2;
+                continue;
+            }
         } else if (c == '\n' && !in_quote &&
                    (size_t)((scan + 1) - data) >= next_target) {
             const uint8_t *target_end = scan + 1;
@@ -2082,7 +2088,11 @@ static cisv_chunk_t *split_chunks_with_quote(
             for (const uint8_t *p = chunk_start; p < target_end; p++) {
                 uint8_t ch = *p;
                 if (chunk_in_quote) {
-                    if (ch == (uint8_t)quote_char) {
+                    if (escape_char != '\0' && ch == (uint8_t)escape_char) {
+                        if (p + 1 < target_end) {
+                            p++;
+                        }
+                    } else if (ch == (uint8_t)quote_char) {
                         if (p + 1 < target_end && *(p + 1) == (uint8_t)quote_char) {
                             p++;
                         } else {
@@ -2121,7 +2131,11 @@ static cisv_chunk_t *split_chunks_with_quote(
         for (const uint8_t *p = chunk_start; p < target_end; p++) {
             uint8_t c = *p;
             if (chunk_in_quote) {
-                if (c == (uint8_t)quote_char) {
+                if (escape_char != '\0' && c == (uint8_t)escape_char) {
+                    if (p + 1 < target_end) {
+                        p++;
+                    }
+                } else if (c == (uint8_t)quote_char) {
                     if (p + 1 < target_end && *(p + 1) == (uint8_t)quote_char) {
                         p++;  // Skip escaped quote
                     } else {
@@ -2155,7 +2169,7 @@ cisv_chunk_t *cisv_split_chunks(
     int num_chunks,
     int *chunk_count
 ) {
-    return split_chunks_with_quote(file, num_chunks, chunk_count, '"');
+    return split_chunks_with_quote(file, num_chunks, chunk_count, '"', '\0');
 }
 
 int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
@@ -2702,10 +2716,15 @@ cisv_result_t **cisv_parse_file_parallel(const char *path, const cisv_config *co
     // Split into chunks
     int chunk_count;
     char quote_char = '"';
+    char escape_char = '\0';
     if (config && config->quote != '\0') {
         quote_char = config->quote;
     }
-    cisv_chunk_t *chunks = split_chunks_with_quote(mmap_file, num_threads, &chunk_count, quote_char);
+    if (config && config->escape != '\0') {
+        escape_char = config->escape;
+    }
+    cisv_chunk_t *chunks = split_chunks_with_quote(mmap_file, num_threads, &chunk_count,
+                                                   quote_char, escape_char);
     if (!chunks || chunk_count == 0) {
         cisv_mmap_close(mmap_file);
         return NULL;
