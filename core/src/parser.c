@@ -1814,6 +1814,85 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
     return count + (size > 0 && data[size - 1] != '\n');
 }
 
+static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
+                                     uint8_t delimiter, uint8_t quote_char,
+                                     uint8_t escape_char, bool *ok) {
+    size_t rows = 0;
+    bool in_quote = false;
+    bool at_field_start = true;
+    bool after_quote = false;
+
+    *ok = true;
+
+    for (size_t i = 0; i < size; i++) {
+        uint8_t c = data[i];
+
+        if (in_quote) {
+            if (escape_char != '\0' && c == escape_char) {
+                if (i + 1 >= size) {
+                    *ok = false;
+                    return 0;
+                }
+                i++;
+            } else if (c == quote_char) {
+                if (escape_char == '\0' && i + 1 < size && data[i + 1] == quote_char) {
+                    i++;
+                } else {
+                    in_quote = false;
+                    after_quote = true;
+                }
+            }
+            continue;
+        }
+
+        if (after_quote) {
+            if (c == ' ' || c == '\t') {
+                continue;
+            }
+            if (c == delimiter) {
+                after_quote = false;
+                at_field_start = true;
+                continue;
+            }
+            if (c == '\n') {
+                rows++;
+                after_quote = false;
+                at_field_start = true;
+                continue;
+            }
+            if (c == '\r' && i + 1 < size && data[i + 1] == '\n') {
+                rows++;
+                i++;
+                after_quote = false;
+                at_field_start = true;
+                continue;
+            }
+
+            *ok = false;
+            return 0;
+        }
+
+        if (c == delimiter) {
+            at_field_start = true;
+        } else if (c == '\n') {
+            rows++;
+            at_field_start = true;
+        } else if (c == quote_char && at_field_start) {
+            in_quote = true;
+            at_field_start = false;
+        } else {
+            at_field_start = false;
+        }
+    }
+
+    if (in_quote) {
+        *ok = false;
+        return 0;
+    }
+
+    return rows + (size > 0 && data[size - 1] != '\n');
+}
+
 static void row_count_cb(void *user) {
     cisv_row_counter_t *counter = (cisv_row_counter_t *)user;
     counter->rows++;
@@ -1836,6 +1915,7 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
     } else {
         cisv_config_init(&effective_config);
     }
+    if (!cisv_config_is_valid(&effective_config)) return 0;
 
     bool fast_count_allowed =
         !effective_config.skip_empty_lines &&
@@ -1858,10 +1938,22 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
                 bool saw_quote = false;
                 size_t fast_count = count_newlines_fast(base, (size_t)st.st_size,
                                                         (uint8_t)effective_config.quote, &saw_quote);
+                bool quoted_ok = false;
+                size_t quoted_count = 0;
+                if (saw_quote) {
+                    quoted_count = count_rows_quote_aware(base, (size_t)st.st_size,
+                                                          (uint8_t)effective_config.delimiter,
+                                                          (uint8_t)effective_config.quote,
+                                                          (uint8_t)effective_config.escape,
+                                                          &quoted_ok);
+                }
                 munmap(base, st.st_size);
                 close(fd);
                 if (!saw_quote) {
                     return fast_count;
+                }
+                if (quoted_ok) {
+                    return quoted_count;
                 }
                 fd = -1;
             }

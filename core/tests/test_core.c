@@ -1303,6 +1303,47 @@ void test_count_rows_empty_file(void) {
     }
 }
 
+void test_count_rows_invalid_config_rejected(void) {
+    TEST("count_rows_with_config rejects invalid config");
+
+    const char *path = write_temp_csv("a,b\n1,2\n");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.delimiter = '"';
+    config.quote = '"';
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 0) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected invalid config to return 0, got %zu", count);
+        FAIL(buf);
+    }
+}
+
+void test_count_rows_malformed_quote_returns_zero(void) {
+    TEST("count_rows quote-aware path rejects malformed quote");
+
+    const char *path = write_temp_csv("a,b\n\"x\"z,1\n");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 0) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected malformed count to return 0, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_parser_reuse_no_fd_leak(void) {
     TEST("parser reuse does not leak file descriptors");
 
@@ -2065,6 +2106,8 @@ int main(void) {
     test_count_rows_with_row_controls();
     test_count_rows_final_row_without_newline();
     test_count_rows_empty_file();
+    test_count_rows_invalid_config_rejected();
+    test_count_rows_malformed_quote_returns_zero();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
     test_streaming_rfc_quote_across_chunk_boundary();
