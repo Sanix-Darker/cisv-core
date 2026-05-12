@@ -954,7 +954,7 @@ static inline void yield_row(cisv_parser *p) {
 }
 
 // Forward declare all parse functions
-#ifdef __AVX512F__
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 static void parse_avx512(cisv_parser *p);
 #endif
 #ifdef __AVX2__
@@ -963,7 +963,7 @@ static void parse_avx2(cisv_parser *p);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
 static void parse_neon(cisv_parser *p);
 #endif
-#if defined(__SSE2__) && !defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__SSE2__) && !defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 static void parse_sse2(cisv_parser *p);
 #endif
 // Scalar fallback for platforms without SIMD
@@ -976,8 +976,8 @@ static inline void parse_dispatch(cisv_parser *p) {
     }
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#ifdef __AVX512F__
-    if (__builtin_cpu_supports("avx512f")) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")) {
         p->parse_impl = parse_avx512;
         p->parse_impl(p);
         return;
@@ -990,7 +990,7 @@ static inline void parse_dispatch(cisv_parser *p) {
         return;
     }
 #endif
-#if defined(__SSE2__) && !defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__SSE2__) && !defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
     p->parse_impl = parse_sse2;
     p->parse_impl(p);
     return;
@@ -1007,7 +1007,7 @@ static inline void parse_dispatch(cisv_parser *p) {
     p->parse_impl(p);
 }
 
-#ifdef __AVX512F__
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 // AVX-512 ultra-fast path
 // PERF: __attribute__((hot)) tells compiler this is frequently called
 __attribute__((hot))
@@ -1429,7 +1429,7 @@ static void parse_neon(cisv_parser *p) {
 }
 #endif
 
-#if defined(__SSE2__) && !defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__SSE2__) && !defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 // SSE2 fast path for older x86-64 machines (16 bytes at a time)
 // PERF: __attribute__((hot)) tells compiler this is frequently called
 __attribute__((hot))
