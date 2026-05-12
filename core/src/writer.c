@@ -160,17 +160,14 @@ static int write_quoted_field_simd(cisv_writer *writer, const char *data, size_t
             out += 32;
             i += 32;
         } else {
-            // Slow path: process bytes with quotes one at a time
-            while (mask && i < len) {
+            // Slow path: preserve every byte in this chunk while doubling quotes.
+            size_t chunk_end = i + 32;
+            while (i < chunk_end) {
                 if (data[i] == writer->quote_char) {
                     *out++ = writer->quote_char;  // Escape quote
                 }
                 *out++ = data[i++];
-                mask >>= 1;
             }
-            // Continue with next aligned chunk
-            i = (i + 31) & ~31UL;
-            if (i > len) i = len;
         }
     }
 
@@ -271,6 +268,23 @@ cisv_writer *cisv_writer_create(FILE *output) {
 cisv_writer *cisv_writer_create_config(FILE *output, const cisv_writer_config *config) {
     if (!output) return NULL;
 
+    cisv_writer_config default_config = {
+        .delimiter = ',',
+        .quote_char = '"',
+        .always_quote = 0,
+        .use_crlf = 0,
+        .null_string = "",
+        .buffer_size = DEFAULT_BUFFER_SIZE
+    };
+    if (!config) {
+        config = &default_config;
+    }
+
+    if (config->delimiter == '\0' || config->quote_char == '\0') return NULL;
+    if (config->delimiter == config->quote_char) return NULL;
+    if (config->delimiter == '\n' || config->delimiter == '\r') return NULL;
+    if (config->quote_char == '\n' || config->quote_char == '\r') return NULL;
+
     cisv_writer *writer = calloc(1, sizeof(*writer));
     if (!writer) return NULL;
 
@@ -356,12 +370,15 @@ int cisv_writer_field_str(cisv_writer *writer, const char *str) {
 int cisv_writer_field_int(cisv_writer *writer, int64_t value) {
     char buffer[32];
     int len = snprintf(buffer, sizeof(buffer), "%lld", (long long)value);
+    if (len < 0 || (size_t)len >= sizeof(buffer)) return -1;
     return cisv_writer_field(writer, buffer, len);
 }
 
 int cisv_writer_field_double(cisv_writer *writer, double value, int precision) {
+    if (precision < 0 || precision > 17) return -1;
     char buffer[64];
     int len = snprintf(buffer, sizeof(buffer), "%.*f", precision, value);
+    if (len < 0 || (size_t)len >= sizeof(buffer)) return -1;
     return cisv_writer_field(writer, buffer, len);
 }
 

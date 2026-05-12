@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@ static int pass_count = 0;
 // Test data
 static int field_count = 0;
 static int row_count = 0;
+static int error_count = 0;
 static char last_field[1024];
 
 // Stored fields for multiline tests
@@ -56,9 +58,17 @@ static void test_row_cb(void *user) {
     row_count++;
 }
 
+static void test_error_cb(void *user, int line, const char *msg) {
+    (void)user;
+    (void)line;
+    (void)msg;
+    error_count++;
+}
+
 static void reset_test_state(void) {
     field_count = 0;
     row_count = 0;
+    error_count = 0;
     stored_field_count = 0;
     memset(last_field, 0, sizeof(last_field));
 }
@@ -72,6 +82,25 @@ static const char* write_temp_csv(const char *content) {
     fwrite(content, 1, strlen(content), f);
     fclose(f);
     return path;
+}
+
+static char *save_env_value(const char *name) {
+    const char *value = getenv(name);
+    if (!value) return NULL;
+    size_t len = strlen(value);
+    char *copy = malloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, value, len + 1);
+    return copy;
+}
+
+static void restore_env_value(const char *name, char *value) {
+    if (value) {
+        setenv(name, value, 1);
+        free(value);
+    } else {
+        unsetenv(name);
+    }
 }
 
 static int count_open_fds(void) {
@@ -129,6 +158,239 @@ void test_parser_lifecycle(void) {
 
     cisv_parser_destroy(parser);
     PASS();
+}
+
+void test_invalid_parser_config_rejected(void) {
+    TEST("invalid parser config rejected");
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    int ok = 1;
+
+    config.delimiter = '"';
+    config.quote = '"';
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (parser) {
+        cisv_parser_destroy(parser);
+        ok = 0;
+    }
+
+    cisv_config_init(&config);
+    config.delimiter = '\n';
+    parser = cisv_parser_create_with_config(&config);
+    if (parser) {
+        cisv_parser_destroy(parser);
+        ok = 0;
+    }
+
+    cisv_config_init(&config);
+    config.escape = '"';
+    parser = cisv_parser_create_with_config(&config);
+    if (parser) {
+        cisv_parser_destroy(parser);
+        ok = 0;
+    }
+
+    cisv_config_init(&config);
+    config.to_line = 1;
+    config.from_line = 2;
+    parser = cisv_parser_create_with_config(&config);
+    if (parser) {
+        cisv_parser_destroy(parser);
+        ok = 0;
+    }
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("accepted invalid parser config");
+    }
+}
+
+void test_resource_env_row_limit_and_override(void) {
+    TEST("resource env row limit and explicit override");
+
+    char *old_row = save_env_value("CISV_MAX_ROW_SIZE");
+    setenv("CISV_MAX_ROW_SIZE", "8", 1);
+
+    const char *csv = "123456789,x\n";
+
+    cisv_config config;
+    cisv_config_init(&config);
+    cisv_result_t *limited = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    cisv_config_init(&config);
+    config.max_row_size = 64;
+    cisv_result_t *explicit_ok = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+
+    int ok = limited &&
+             limited->error_code != 0 &&
+             explicit_ok &&
+             explicit_ok->error_code == 0 &&
+             explicit_ok->row_count == 1 &&
+             explicit_ok->total_fields == 2;
+
+    cisv_result_free(limited);
+    cisv_result_free(explicit_ok);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("env row limit did not apply or explicit max_row_size did not override it");
+    }
+}
+
+void test_gomemlimit_adaptive_row_limit(void) {
+    TEST("GOMEMLIMIT adaptive row limit and explicit override");
+
+    char *old_cisv_memory = save_env_value("CISV_MAX_MEMORY");
+    char *old_go_memory = save_env_value("GOMEMLIMIT");
+    char *old_row = save_env_value("CISV_MAX_ROW_SIZE");
+    unsetenv("CISV_MAX_MEMORY");
+    unsetenv("CISV_MAX_ROW_SIZE");
+    setenv("GOMEMLIMIT", "1MiB", 1);
+
+    const size_t field_len = 70000;
+    char *csv = malloc(field_len + 4);
+    if (!csv) {
+        restore_env_value("CISV_MAX_MEMORY", old_cisv_memory);
+        restore_env_value("GOMEMLIMIT", old_go_memory);
+        restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+        FAIL("failed to allocate test csv");
+        return;
+    }
+    memset(csv, 'x', field_len);
+    memcpy(csv + field_len, ",y\n", 4);
+
+    cisv_config config;
+    cisv_config_init(&config);
+    cisv_result_t *limited = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    cisv_config_init(&config);
+    config.max_row_size = 100000;
+    cisv_result_t *explicit_ok = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    free(csv);
+    restore_env_value("CISV_MAX_MEMORY", old_cisv_memory);
+    restore_env_value("GOMEMLIMIT", old_go_memory);
+    restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+
+    int ok = limited &&
+             limited->error_code != 0 &&
+             explicit_ok &&
+             explicit_ok->error_code == 0 &&
+             explicit_ok->row_count == 1 &&
+             explicit_ok->total_fields == 2;
+
+    cisv_result_free(limited);
+    cisv_result_free(explicit_ok);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("GOMEMLIMIT adaptive row limit did not fail or explicit override did not pass");
+    }
+}
+
+void test_resource_env_max_procs_clamps_parallel(void) {
+    TEST("resource env max procs clamps parallel parse");
+
+    char *old_cisv = save_env_value("CISV_MAX_PROCS");
+    char *old_go = save_env_value("GOMAXPROCS");
+    unsetenv("CISV_MAX_PROCS");
+    setenv("GOMAXPROCS", "1", 1);
+
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/test_cisv_env_procs_%d.csv", getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        restore_env_value("CISV_MAX_PROCS", old_cisv);
+        restore_env_value("GOMAXPROCS", old_go);
+        FAIL("failed to create temp file");
+        return;
+    }
+    fputs("a,b\n", f);
+    for (int i = 0; i < 5000; i++) {
+        fprintf(f, "%d,%d\n", i, i + 1);
+    }
+    fclose(f);
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    int result_count = 0;
+    cisv_result_t **results = cisv_parse_file_parallel(path, &config, 0, &result_count);
+
+    restore_env_value("CISV_MAX_PROCS", old_cisv);
+    restore_env_value("GOMAXPROCS", old_go);
+    unlink(path);
+
+    int ok = results && result_count == 1 && results[0] &&
+             results[0]->error_code == 0 &&
+             results[0]->row_count == 5001;
+
+    cisv_results_free(results, result_count);
+
+    if (ok) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected one parallel result, got count=%d", result_count);
+        FAIL(buf);
+    }
+}
+
+void test_iterator_resource_row_limit(void) {
+    TEST("iterator resource row limit");
+
+    char *old_row = save_env_value("CISV_MAX_ROW_SIZE");
+    setenv("CISV_MAX_ROW_SIZE", "8", 1);
+
+    const char *path = write_temp_csv("123456789,x\n");
+    if (!path) {
+        restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    cisv_iterator_t *it = cisv_iterator_open(path, &config);
+    if (!it) {
+        unlink(path);
+        restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+        FAIL("failed to open iterator");
+        return;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    int rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+    cisv_iterator_close(it);
+
+    config.max_row_size = 64;
+    it = cisv_iterator_open(path, &config);
+    int rc_override = CISV_ITER_ERROR;
+    if (it) {
+        rc_override = cisv_iterator_next(it, &fields, &lengths, &field_count);
+        cisv_iterator_close(it);
+    }
+
+    unlink(path);
+    restore_env_value("CISV_MAX_ROW_SIZE", old_row);
+
+    if (rc == CISV_ITER_ERROR && rc_override == CISV_ITER_OK && field_count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected iterator limit error then override success, got rc=%d override=%d fields=%zu",
+                 rc, rc_override, field_count);
+        FAIL(buf);
+    }
 }
 
 // Test: Parse simple CSV string
@@ -459,6 +721,102 @@ void test_writer_quoting(void) {
     }
 }
 
+void test_writer_long_quoted_field_with_quotes(void) {
+    TEST("writer long quoted field with embedded quotes");
+
+    FILE *tmp = tmpfile();
+    if (!tmp) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_writer *writer = cisv_writer_create(tmp);
+    if (!writer) {
+        fclose(tmp);
+        FAIL("failed to create writer");
+        return;
+    }
+
+    char field[96];
+    memset(field, 'a', 80);
+    field[1] = '"';
+    field[40] = '"';
+
+    char expected[256];
+    size_t pos = 0;
+    expected[pos++] = '"';
+    for (size_t i = 0; i < 80; i++) {
+        if (field[i] == '"') expected[pos++] = '"';
+        expected[pos++] = field[i];
+    }
+    expected[pos++] = '"';
+    expected[pos++] = '\n';
+    expected[pos] = '\0';
+
+    cisv_writer_field(writer, field, 80);
+    cisv_writer_row_end(writer);
+    cisv_writer_flush(writer);
+
+    fseek(tmp, 0, SEEK_SET);
+    char buf[256];
+    size_t len = fread(buf, 1, sizeof(buf) - 1, tmp);
+    buf[len] = '\0';
+
+    cisv_writer_destroy(writer);
+    fclose(tmp);
+
+    if (strcmp(buf, expected) == 0) {
+        PASS();
+    } else {
+        FAIL("long quoted writer output mismatch");
+    }
+}
+
+void test_writer_config_validation(void) {
+    TEST("writer config validation");
+
+    FILE *tmp = tmpfile();
+    if (!tmp) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_writer *writer = cisv_writer_create_config(tmp, NULL);
+    int ok = writer != NULL;
+    cisv_writer_destroy(writer);
+
+    cisv_writer_config config = {
+        .delimiter = ',',
+        .quote_char = ',',
+        .always_quote = 0,
+        .use_crlf = 0,
+        .null_string = "",
+        .buffer_size = 0
+    };
+
+    writer = cisv_writer_create_config(tmp, &config);
+    if (writer) {
+        cisv_writer_destroy(writer);
+        ok = 0;
+    }
+
+    config.delimiter = '\n';
+    config.quote_char = '"';
+    writer = cisv_writer_create_config(tmp, &config);
+    if (writer) {
+        cisv_writer_destroy(writer);
+        ok = 0;
+    }
+
+    fclose(tmp);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("writer accepted invalid config or rejected NULL defaults");
+    }
+}
+
 // Test: Base64 encode
 void test_base64_encode(void) {
     TEST("base64 encode");
@@ -741,6 +1099,30 @@ void test_count_rows_with_escape_config(void) {
     }
 }
 
+void test_count_rows_with_row_controls(void) {
+    TEST("count_rows_with_config respects row controls");
+
+    const char *csv = "#comment\n\nh1,h2\n1,2\n";
+    const char *path = write_temp_csv(csv);
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.comment = '#';
+    config.skip_empty_lines = true;
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_parser_reuse_no_fd_leak(void) {
     TEST("parser reuse does not leak file descriptors");
 
@@ -807,6 +1189,231 @@ void test_streaming_chunk_boundaries(void) {
     } else {
         char buf[128];
         snprintf(buf, sizeof(buf), "expected 4 fields/2 rows, got %d/%d", field_count, row_count);
+        FAIL(buf);
+    }
+}
+
+void test_streaming_rfc_quote_across_chunk_boundary(void) {
+    TEST("streaming RFC quote escape across chunk boundary");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *chunk1 = "\"a\"";
+    const char *chunk2 = "\"b\",c\n";
+    int rc1 = cisv_parser_write(parser, (const uint8_t *)chunk1, strlen(chunk1));
+    int rc2 = cisv_parser_write(parser, (const uint8_t *)chunk2, strlen(chunk2));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (rc1 == 0 && rc2 == 0 &&
+        error_count == 0 &&
+        field_count == 2 &&
+        row_count == 1 &&
+        strcmp(stored_fields[0], "a\"b") == 0 &&
+        strcmp(stored_fields[1], "c") == 0) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected escaped quote across chunks, got fields=%d rows=%d errors=%d first='%s'",
+                 field_count, row_count, error_count,
+                 stored_field_count > 0 ? stored_fields[0] : "");
+        FAIL(buf);
+    }
+}
+
+void test_skip_empty_preserves_empty_fields(void) {
+    TEST("skip_empty_lines preserves empty fields");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.skip_empty_lines = true;
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *csv = "a,,c\n\n1,,3\n";
+    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (field_count == 6 && row_count == 2 &&
+        strcmp(stored_fields[0], "a") == 0 &&
+        strcmp(stored_fields[1], "") == 0 &&
+        strcmp(stored_fields[2], "c") == 0 &&
+        strcmp(stored_fields[3], "1") == 0 &&
+        strcmp(stored_fields[4], "") == 0 &&
+        strcmp(stored_fields[5], "3") == 0) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected 6 fields/2 rows with empty fields preserved, got %d/%d",
+                 field_count, row_count);
+        FAIL(buf);
+    }
+}
+
+void test_batch_line_range_grouping(void) {
+    TEST("batch parser line range field grouping");
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.from_line = 2;
+    config.to_line = 2;
+
+    const char *csv = "h1,h2\n1,2\n3,4\n";
+    cisv_result_t *result = cisv_parse_string_batch(csv, strlen(csv), &config);
+    if (!result) {
+        FAIL("failed to parse batch string");
+        return;
+    }
+
+    int ok = result->error_code == 0 &&
+             result->row_count == 1 &&
+             result->total_fields == 2 &&
+             result->rows[0].field_count == 2 &&
+             strcmp(result->rows[0].fields[0], "1") == 0 &&
+             strcmp(result->rows[0].fields[1], "2") == 0;
+
+    cisv_result_free(result);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("batch line range included fields from skipped rows");
+    }
+}
+
+void test_trailing_empty_field_at_eof(void) {
+    TEST("trailing empty field at EOF");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *csv = "a,";
+    cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    cisv_result_t *batch = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    int ok = field_count == 2 && row_count == 1 &&
+             strcmp(stored_fields[0], "a") == 0 &&
+             strcmp(stored_fields[1], "") == 0 &&
+             batch && batch->error_code == 0 &&
+             batch->row_count == 1 &&
+             batch->total_fields == 2 &&
+             strcmp(batch->rows[0].fields[0], "a") == 0 &&
+             strcmp(batch->rows[0].fields[1], "") == 0;
+
+    cisv_result_free(batch);
+
+    if (ok) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected trailing empty field, got callback fields=%d rows=%d",
+                 field_count, row_count);
+        FAIL(buf);
+    }
+}
+
+void test_quoted_field_closes_at_eof(void) {
+    TEST("quoted field closes at EOF");
+    reset_test_state();
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) { FAIL("failed to create parser"); return; }
+
+    const char *csv = "\"say \"\"hello\"\"\",\"test\"";
+    int rc = cisv_parser_write(parser, (const uint8_t *)csv, strlen(csv));
+    cisv_parser_end(parser);
+    cisv_parser_destroy(parser);
+
+    if (rc == 0 &&
+        error_count == 0 &&
+        field_count == 2 &&
+        row_count == 1 &&
+        strcmp(stored_fields[0], "say \"hello\"") == 0 &&
+        strcmp(stored_fields[1], "test") == 0) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected quoted EOF row, got fields=%d rows=%d errors=%d first='%s'",
+                 field_count, row_count, error_count,
+                 stored_field_count > 0 ? stored_fields[0] : "");
+        FAIL(buf);
+    }
+}
+
+void test_malformed_quote_errors(void) {
+    TEST("malformed quoted fields report errors");
+    reset_test_state();
+
+    const char *csv = "\"unterminated";
+    cisv_config config;
+    cisv_config_init(&config);
+    config.field_cb = test_field_cb;
+    config.row_cb = test_row_cb;
+    config.error_cb = test_error_cb;
+
+    cisv_result_t *batch = cisv_parse_string_batch(csv, strlen(csv), &config);
+
+    const char *path = write_temp_csv("\"a\"x,b\n");
+    if (!path) {
+        cisv_result_free(batch);
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_parser *parser = cisv_parser_create_with_config(&config);
+    if (!parser) {
+        cisv_result_free(batch);
+        unlink(path);
+        FAIL("failed to create parser");
+        return;
+    }
+
+    int rc = cisv_parser_parse_file(parser, path);
+    cisv_parser_destroy(parser);
+    unlink(path);
+
+    int batch_error_code = batch ? batch->error_code : 0;
+    int ok = batch &&
+             batch_error_code != 0 &&
+             rc < 0 &&
+             error_count >= 1;
+
+    cisv_result_free(batch);
+
+    if (ok) {
+        PASS();
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "expected strict errors, got batch=%d rc=%d errors=%d",
+                 batch_error_code, rc, error_count);
         FAIL(buf);
     }
 }
@@ -1077,6 +1684,11 @@ int main(void) {
     printf("Parser Tests:\n");
     test_config_init();
     test_parser_lifecycle();
+    test_invalid_parser_config_rejected();
+    test_resource_env_row_limit_and_override();
+    test_gomemlimit_adaptive_row_limit();
+    test_resource_env_max_procs_clamps_parallel();
+    test_iterator_resource_row_limit();
     test_parse_simple();
     test_parse_custom_delimiter();
     test_parse_quoted();
@@ -1095,6 +1707,8 @@ int main(void) {
     printf("\nWriter Tests:\n");
     test_writer_basic();
     test_writer_quoting();
+    test_writer_long_quoted_field_with_quotes();
+    test_writer_config_validation();
 
     // Multiline tests (issue #108)
     printf("\nMultiline Tests (Issue #108):\n");
@@ -1107,8 +1721,15 @@ int main(void) {
     test_parse_multiline_issue108();
     test_count_rows_with_config_custom_quote();
     test_count_rows_with_escape_config();
+    test_count_rows_with_row_controls();
     test_parser_reuse_no_fd_leak();
     test_streaming_chunk_boundaries();
+    test_streaming_rfc_quote_across_chunk_boundary();
+    test_skip_empty_preserves_empty_fields();
+    test_batch_line_range_grouping();
+    test_trailing_empty_field_at_eof();
+    test_quoted_field_closes_at_eof();
+    test_malformed_quote_errors();
     test_parse_comment_lines();
     test_max_row_size_skip_error_lines();
     test_parallel_custom_quote_chunk_split();

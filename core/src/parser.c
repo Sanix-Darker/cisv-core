@@ -65,8 +65,11 @@ typedef struct cisv_parser {
     int from_line;
     int to_line;
     size_t max_row_size;
+    size_t memory_budget;
     bool skip_lines_with_error;
     bool has_row_controls;
+    bool relaxed;
+    bool had_error;
     void (*parse_impl)(struct cisv_parser *p);
 
     // Statistics
@@ -83,6 +86,7 @@ typedef struct cisv_parser {
     size_t quote_buffer_pos;
     const uint8_t *quoted_field_start;
     bool quoted_field_buffered;
+    bool quoted_pending_quote;
 
     // Buffer for streaming mode - holds partial unquoted fields across chunks
     uint8_t *stream_buffer;
@@ -209,6 +213,168 @@ void cisv_config_init(cisv_config *config) {
     config->from_line = 1;
 }
 
+static bool cisv_config_is_valid(const cisv_config *config) {
+    if (!config) return false;
+
+    if (config->delimiter == '\0' || config->quote == '\0') return false;
+    if (config->delimiter == config->quote) return false;
+    if (config->delimiter == '\n' || config->delimiter == '\r') return false;
+    if (config->quote == '\n' || config->quote == '\r') return false;
+
+    if (config->escape != '\0') {
+        if (config->escape == '\n' || config->escape == '\r') return false;
+        if (config->escape == config->delimiter) return false;
+        if (config->escape == config->quote) return false;
+    }
+
+    if (config->comment == '\n' || config->comment == '\r') return false;
+    if (config->from_line < 0 || config->to_line < 0) return false;
+    int from_line = config->from_line > 0 ? config->from_line : 1;
+    if (config->to_line != 0 && config->to_line < from_line) return false;
+
+    return true;
+}
+
+static const char *cisv_getenv_first(const char *primary, const char *fallback) {
+    const char *value = getenv(primary);
+    if (value && *value) return value;
+    value = getenv(fallback);
+    return (value && *value) ? value : NULL;
+}
+
+static bool parse_positive_size_env(const char *value, size_t *out) {
+    if (!value || !*value || !out) return false;
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long number = strtoull(value, &end, 10);
+    if (errno != 0 || end == value || number == 0) return false;
+
+    while (*end == ' ' || *end == '\t') end++;
+
+    unsigned long long multiplier = 1;
+    if (*end != '\0') {
+        if ((end[0] == 'k' || end[0] == 'K') && end[1] == '\0') {
+            multiplier = 1024ULL;
+        } else if ((end[0] == 'm' || end[0] == 'M') && end[1] == '\0') {
+            multiplier = 1024ULL * 1024ULL;
+        } else if ((end[0] == 'g' || end[0] == 'G') && end[1] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+        } else if ((end[0] == 't' || end[0] == 'T') && end[1] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+        } else if ((end[0] == 'k' || end[0] == 'K') &&
+                   (end[1] == 'b' || end[1] == 'B') && end[2] == '\0') {
+            multiplier = 1024ULL;
+        } else if ((end[0] == 'm' || end[0] == 'M') &&
+                   (end[1] == 'b' || end[1] == 'B') && end[2] == '\0') {
+            multiplier = 1024ULL * 1024ULL;
+        } else if ((end[0] == 'g' || end[0] == 'G') &&
+                   (end[1] == 'b' || end[1] == 'B') && end[2] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+        } else if ((end[0] == 't' || end[0] == 'T') &&
+                   (end[1] == 'b' || end[1] == 'B') && end[2] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+        } else if ((end[0] == 'k' || end[0] == 'K') &&
+                   (end[1] == 'i' || end[1] == 'I') &&
+                   (end[2] == 'b' || end[2] == 'B') && end[3] == '\0') {
+            multiplier = 1024ULL;
+        } else if ((end[0] == 'm' || end[0] == 'M') &&
+                   (end[1] == 'i' || end[1] == 'I') &&
+                   (end[2] == 'b' || end[2] == 'B') && end[3] == '\0') {
+            multiplier = 1024ULL * 1024ULL;
+        } else if ((end[0] == 'g' || end[0] == 'G') &&
+                   (end[1] == 'i' || end[1] == 'I') &&
+                   (end[2] == 'b' || end[2] == 'B') && end[3] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+        } else if ((end[0] == 't' || end[0] == 'T') &&
+                   (end[1] == 'i' || end[1] == 'I') &&
+                   (end[2] == 'b' || end[2] == 'B') && end[3] == '\0') {
+            multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+        } else {
+            return false;
+        }
+    }
+
+    if (number > (unsigned long long)SIZE_MAX / multiplier) return false;
+    *out = (size_t)(number * multiplier);
+    return true;
+}
+
+static bool parse_positive_int_env(const char *value, int *out) {
+    size_t parsed = 0;
+    if (!parse_positive_size_env(value, &parsed) || parsed > (size_t)INT_MAX) {
+        return false;
+    }
+    *out = (int)parsed;
+    return true;
+}
+
+static int cisv_runtime_max_procs(void) {
+    int parsed = 0;
+    const char *value = cisv_getenv_first("CISV_MAX_PROCS", "GOMAXPROCS");
+    if (parse_positive_int_env(value, &parsed)) {
+        return parsed;
+    }
+    return 0;
+}
+
+static size_t cisv_runtime_memory_budget(void) {
+    size_t parsed = 0;
+    const char *value = cisv_getenv_first("CISV_MAX_MEMORY", "GOMEMLIMIT");
+    if (parse_positive_size_env(value, &parsed)) {
+        return parsed;
+    }
+    return 0;
+}
+
+static size_t cisv_runtime_max_row_size(void) {
+    size_t parsed = 0;
+    const char *value = getenv("CISV_MAX_ROW_SIZE");
+    if (parse_positive_size_env(value, &parsed)) {
+        return parsed;
+    }
+    return 0;
+}
+
+static size_t cisv_runtime_parallel_min_bytes(void) {
+    size_t parsed = 0;
+    const char *value = getenv("CISV_PARALLEL_MIN_BYTES");
+    if (parse_positive_size_env(value, &parsed)) {
+        return parsed;
+    }
+    return 0;
+}
+
+static size_t cisv_adaptive_row_limit(size_t memory_budget) {
+    if (memory_budget == 0) return 0;
+
+    size_t limit = memory_budget / 16;
+    if (limit < 64 * 1024) {
+        limit = 64 * 1024;
+    }
+    if (limit > 128 * 1024 * 1024) {
+        limit = 128 * 1024 * 1024;
+    }
+    if (limit > memory_budget) {
+        limit = memory_budget;
+    }
+    return limit;
+}
+
+static size_t cisv_buffer_limit_from_budget(size_t memory_budget) {
+    const size_t max_buffer = 100 * 1024 * 1024;
+    const size_t min_buffer = 64 * 1024;
+    if (memory_budget == 0) return max_buffer;
+    size_t limit = memory_budget / 4;
+    if (limit < min_buffer) {
+        limit = min_buffer;
+    }
+    if (limit > max_buffer) {
+        limit = max_buffer;
+    }
+    return limit;
+}
+
 // Maximum quote buffer size to prevent DoS (100MB)
 #define MAX_QUOTE_BUFFER_SIZE (100 * 1024 * 1024)
 // Minimum buffer increment for efficiency (64KB)
@@ -218,6 +384,8 @@ void cisv_config_init(cisv_config *config) {
 
 // Ensure quote buffer has enough space
 // Optimized: 1.5x growth with 64KB minimum increment, cache-line aligned
+static inline void parser_report_error(cisv_parser *p, int line, const char *msg);
+
 static inline bool ensure_quote_buffer(cisv_parser *p, size_t needed) {
     size_t required = p->quote_buffer_pos + needed;
     if (__builtin_expect(required <= p->quote_buffer_size, 1)) {
@@ -239,8 +407,8 @@ static inline bool ensure_quote_buffer(cisv_parser *p, size_t needed) {
     // Align to cache line for SIMD access
     new_size = (new_size + CACHE_LINE_SIZE - 1) & ~(size_t)(CACHE_LINE_SIZE - 1);
 
-    // Enforce maximum buffer size to prevent DoS
-    if (new_size > MAX_QUOTE_BUFFER_SIZE) return false;
+    // Enforce maximum buffer size to prevent DoS and configured memory budget.
+    if (new_size > cisv_buffer_limit_from_budget(p->memory_budget)) return false;
 
     // cppcheck-suppress memleak
     // realloc ownership is transferred to tmp; on failure old pointer stays in p->quote_buffer.
@@ -265,7 +433,7 @@ static inline bool ensure_stream_buffer(cisv_parser *p, size_t needed) {
     // Check required size with overflow protection
     size_t required;
     if (__builtin_add_overflow(p->stream_buffer_pos, needed, &required)) {
-        if (p->ecb) p->ecb(p->user, p->line_num, "Stream buffer size overflow");
+        parser_report_error(p, p->line_num + 1, "Stream buffer size overflow");
         return false;
     }
 
@@ -277,9 +445,9 @@ static inline bool ensure_stream_buffer(cisv_parser *p, size_t needed) {
     size_t grow_size = p->stream_buffer_size + (p->stream_buffer_size >> 1);
     size_t new_size = (grow_size > required) ? grow_size : required;
 
-    // Enforce maximum buffer size to prevent DoS
-    if (new_size > MAX_QUOTE_BUFFER_SIZE) {
-        if (p->ecb) p->ecb(p->user, p->line_num, "Stream buffer exceeds maximum size");
+    // Enforce maximum buffer size to prevent DoS and configured memory budget.
+    if (new_size > cisv_buffer_limit_from_budget(p->memory_budget)) {
+        parser_report_error(p, p->line_num + 1, "Stream buffer exceeds maximum size");
         return false;
     }
 
@@ -289,7 +457,7 @@ static inline bool ensure_stream_buffer(cisv_parser *p, size_t needed) {
     if (!tmp) {
         // SECURITY: On realloc failure, old buffer is still valid
         // Report error but don't invalidate existing buffer
-        if (p->ecb) p->ecb(p->user, p->line_num, "Stream buffer allocation failed");
+        parser_report_error(p, p->line_num + 1, "Stream buffer allocation failed");
         return false;
     }
     p->stream_buffer = tmp;
@@ -306,20 +474,52 @@ static inline bool append_to_stream_buffer(cisv_parser *p, const uint8_t *data, 
 }
 
 static inline void yield_row(cisv_parser *p);
+static inline void yield_field(cisv_parser *p, const uint8_t *start, const uint8_t *end);
+
+static inline void parser_report_error(cisv_parser *p, int line, const char *msg) {
+    if (!p) return;
+    if (!p->relaxed) {
+        p->had_error = true;
+    }
+    if (p->skip_lines_with_error) {
+        p->skip_current_row = true;
+    }
+    if (p->ecb) {
+        p->ecb(p->user, line, msg);
+    }
+}
+
+static inline bool row_in_emit_range(const cisv_parser *p) {
+    int row_num = p->line_num + 1;
+    return row_num >= p->from_line && (!p->to_line || row_num <= p->to_line);
+}
+
+static inline bool is_empty_physical_row(const cisv_parser *p, const uint8_t *field_end) {
+    return p->skip_empty_lines &&
+           p->current_row_fields == 0 &&
+           p->field_start == field_end;
+}
+
+static inline void yield_line_end(cisv_parser *p, const uint8_t *field_end) {
+    if (!is_empty_physical_row(p, field_end)) {
+        yield_field(p, p->field_start, field_end);
+    }
+    yield_row(p);
+}
 
 // Inline hot-path functions
 static inline void yield_field(cisv_parser *p, const uint8_t *start, const uint8_t *end) {
-    if (!p->fcb) return;
+    bool emit_field = p->fcb && row_in_emit_range(p);
 
     // In streaming mode, check if we have buffered partial field data
     // SECURITY: Add NULL check for stream_buffer to prevent NULL dereference
-    if (p->streaming_mode && p->stream_buffer_pos > 0 && p->stream_buffer) {
+    if (emit_field && p->streaming_mode && p->stream_buffer_pos > 0 && p->stream_buffer) {
         // Append current field data to stream buffer and yield from there
         size_t current_len = end - start;
         if (current_len > 0) {
             if (!append_to_stream_buffer(p, start, current_len)) {
                 // Buffer overflow - report error and yield what we have from original pointers
-                if (p->ecb) p->ecb(p->user, p->line_num, "Field exceeds maximum buffer size");
+                parser_report_error(p, p->line_num + 1, "Field exceeds maximum buffer size");
                 p->stream_buffer_pos = 0;
                 // Don't return - yield the original field data
             } else {
@@ -330,6 +530,8 @@ static inline void yield_field(cisv_parser *p, const uint8_t *start, const uint8
             start = p->stream_buffer;
             end = p->stream_buffer + p->stream_buffer_pos;
         }
+    } else if (p->streaming_mode && p->stream_buffer_pos > 0) {
+        p->stream_buffer_pos = 0;
     }
 
     if (__builtin_expect(p->trim, 0)) {
@@ -354,43 +556,41 @@ static inline void yield_field(cisv_parser *p, const uint8_t *start, const uint8
 #endif
     }
 
-    if (__builtin_expect(start < end || !p->skip_empty_lines, 1)) {
-        size_t field_len = (size_t)(end - start);
+    size_t field_len = (size_t)(end - start);
 
-        if (__builtin_expect(p->has_row_controls, 0)) {
-            // Detect comment lines from the first unquoted field.
-            if (p->current_row_fields == 0) {
-                p->row_is_comment = (field_len > 0 && start[0] == (uint8_t)p->comment && p->comment != 0);
-                if (p->row_is_comment) {
-                    p->skip_current_row = true;
-                }
-            }
-
-            if (!p->skip_current_row && p->max_row_size > 0) {
-                size_t next_size = p->current_row_size + field_len + 1;  // +1 delimiter/newline budget
-                if (next_size > p->max_row_size) {
-                    if (p->ecb) {
-                        p->ecb(p->user, p->line_num + 1, "Row exceeds max_row_size");
-                    }
-                    if (p->skip_lines_with_error) {
-                        p->skip_current_row = true;
-                    }
-                }
-                p->current_row_size = next_size;
-            }
-
-            if (p->skip_current_row) {
-                if (__builtin_expect(p->streaming_mode, 0)) {
-                    p->stream_buffer_pos = 0;
-                }
-                return;
+    if (__builtin_expect(p->has_row_controls, 0)) {
+        // Detect comment lines from the first unquoted field.
+        if (p->current_row_fields == 0) {
+            p->row_is_comment = (field_len > 0 && start[0] == (uint8_t)p->comment && p->comment != 0);
+            if (p->row_is_comment) {
+                p->skip_current_row = true;
             }
         }
 
-        p->fcb(p->user, (const char*)start, end - start);
-        p->fields++;
-        p->current_row_fields++;
+        if (!p->skip_current_row && p->max_row_size > 0) {
+            size_t next_size = p->current_row_size + field_len + 1;  // +1 delimiter/newline budget
+            if (next_size < p->current_row_size || next_size > p->max_row_size) {
+                parser_report_error(p, p->line_num + 1, "Row exceeds max_row_size");
+                if (p->skip_lines_with_error) {
+                    p->skip_current_row = true;
+                }
+            }
+            p->current_row_size = next_size;
+        }
+
+        if (p->skip_current_row) {
+            if (__builtin_expect(p->streaming_mode, 0)) {
+                p->stream_buffer_pos = 0;
+            }
+            return;
+        }
     }
+
+    if (emit_field) {
+        p->fcb(p->user, (const char*)start, end - start);
+    }
+    p->fields++;
+    p->current_row_fields++;
 
     // Clear stream buffer after yielding
     if (__builtin_expect(p->streaming_mode, 0)) {
@@ -400,10 +600,9 @@ static inline void yield_field(cisv_parser *p, const uint8_t *start, const uint8
 
 // Yield field from quote buffer
 static inline void yield_quoted_field(cisv_parser *p) {
-    if (!p->fcb) return;
-
     const uint8_t *start = p->quote_buffer;
     const uint8_t *end = p->quote_buffer + p->quote_buffer_pos;
+    bool emit_field = p->fcb && row_in_emit_range(p);
 
     if (__builtin_expect(p->trim, 0)) {
         // Trim leading whitespace - expect few iterations
@@ -412,85 +611,86 @@ static inline void yield_quoted_field(cisv_parser *p) {
         while (start < end && __builtin_expect(is_ws(*(end-1)), 0)) end--;
     }
 
-    if (__builtin_expect(start < end || !p->skip_empty_lines, 1)) {
-        size_t field_len = (size_t)(end - start);
+    size_t field_len = (size_t)(end - start);
 
-        if (__builtin_expect(p->has_row_controls, 0)) {
-            // Quoted first fields are never comment-line prefixes.
-            if (p->current_row_fields == 0) {
-                p->row_is_comment = false;
-            }
-
-            if (!p->skip_current_row && p->max_row_size > 0) {
-                size_t next_size = p->current_row_size + field_len + 1;  // +1 delimiter/newline budget
-                if (next_size > p->max_row_size) {
-                    if (p->ecb) {
-                        p->ecb(p->user, p->line_num + 1, "Row exceeds max_row_size");
-                    }
-                    if (p->skip_lines_with_error) {
-                        p->skip_current_row = true;
-                    }
-                }
-                p->current_row_size = next_size;
-            }
-
-            if (p->skip_current_row) {
-                p->quote_buffer_pos = 0;
-                return;
-            }
+    if (__builtin_expect(p->has_row_controls, 0)) {
+        // Quoted first fields are never comment-line prefixes.
+        if (p->current_row_fields == 0) {
+            p->row_is_comment = false;
         }
 
-        p->fcb(p->user, (const char*)start, end - start);
-        p->fields++;
-        p->current_row_fields++;
+        if (!p->skip_current_row && p->max_row_size > 0) {
+            size_t next_size = p->current_row_size + field_len + 1;  // +1 delimiter/newline budget
+            if (next_size < p->current_row_size || next_size > p->max_row_size) {
+                parser_report_error(p, p->line_num + 1, "Row exceeds max_row_size");
+                if (p->skip_lines_with_error) {
+                    p->skip_current_row = true;
+                }
+            }
+            p->current_row_size = next_size;
+        }
+
+        if (p->skip_current_row) {
+            p->quote_buffer_pos = 0;
+            return;
+        }
     }
+
+    if (emit_field) {
+        p->fcb(p->user, (const char*)start, end - start);
+    }
+    p->fields++;
+    p->current_row_fields++;
 
     p->quote_buffer_pos = 0;
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
+    p->quoted_pending_quote = false;
 }
 
 static inline void yield_quoted_span(cisv_parser *p, const uint8_t *start, const uint8_t *end) {
-    if (!p->fcb) return;
+    bool emit_field = p->fcb && row_in_emit_range(p);
 
     if (__builtin_expect(p->trim, 0)) {
         while (start < end && __builtin_expect(is_ws(*start), 0)) start++;
         while (start < end && __builtin_expect(is_ws(*(end - 1)), 0)) end--;
     }
 
-    if (__builtin_expect(start < end || !p->skip_empty_lines, 1)) {
-        size_t field_len = (size_t)(end - start);
+    size_t field_len = (size_t)(end - start);
 
-        if (__builtin_expect(p->has_row_controls, 0)) {
-            if (p->current_row_fields == 0) {
-                p->row_is_comment = false;
-            }
-
-            if (!p->skip_current_row && p->max_row_size > 0) {
-                size_t next_size = p->current_row_size + field_len + 1;
-                if (next_size > p->max_row_size) {
-                    if (p->ecb) {
-                        p->ecb(p->user, p->line_num + 1, "Row exceeds max_row_size");
-                    }
-                    if (p->skip_lines_with_error) {
-                        p->skip_current_row = true;
-                    }
-                }
-                p->current_row_size = next_size;
-            }
-
-            if (p->skip_current_row) {
-                return;
-            }
+    if (__builtin_expect(p->has_row_controls, 0)) {
+        if (p->current_row_fields == 0) {
+            p->row_is_comment = false;
         }
 
-        p->fcb(p->user, (const char *)start, field_len);
-        p->fields++;
-        p->current_row_fields++;
+        if (!p->skip_current_row && p->max_row_size > 0) {
+            size_t next_size = p->current_row_size + field_len + 1;
+            if (next_size < p->current_row_size || next_size > p->max_row_size) {
+                parser_report_error(p, p->line_num + 1, "Row exceeds max_row_size");
+                if (p->skip_lines_with_error) {
+                    p->skip_current_row = true;
+                }
+            }
+            p->current_row_size = next_size;
+        }
+
+        if (p->skip_current_row) {
+            return;
+        }
     }
+
+    if (emit_field) {
+        p->fcb(p->user, (const char *)start, field_len);
+    }
+    p->fields++;
+    p->current_row_fields++;
 }
 
 static inline void consume_post_quoted_delimiter(cisv_parser *p) {
+    while (p->cur < p->end && (*p->cur == ' ' || *p->cur == '\t')) {
+        p->cur++;
+    }
+
     if (p->cur < p->end && *p->cur == p->delimiter) {
         p->cur++;
     } else if (p->cur < p->end && *p->cur == '\n') {
@@ -500,6 +700,8 @@ static inline void consume_post_quoted_delimiter(cisv_parser *p) {
                p->cur + 1 < p->end && *(p->cur + 1) == '\n') {
         p->cur += 2;
         yield_row(p);
+    } else if (p->cur < p->end) {
+        parser_report_error(p, p->line_num + 1, "Unexpected character after closing quote");
     }
     p->field_start = p->cur;
 }
@@ -508,9 +710,7 @@ static inline bool append_current_quoted_segment(cisv_parser *p, const uint8_t *
                                                  const uint8_t *segment_end) {
     if (segment_end <= segment_start) return true;
     if (!append_to_quote_buffer(p, segment_start, (size_t)(segment_end - segment_start))) {
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Quoted field buffer allocation failed");
-        }
+        parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
         return false;
     }
     p->quoted_field_buffered = true;
@@ -519,6 +719,28 @@ static inline bool append_current_quoted_segment(cisv_parser *p, const uint8_t *
 
 static inline void consume_quoted_field(cisv_parser *p) {
     const uint8_t *segment_start = p->cur;
+
+    if (p->quoted_pending_quote) {
+        p->quoted_pending_quote = false;
+        if (p->cur < p->end && *p->cur == (uint8_t)p->quote) {
+            if (!append_to_quote_buffer(p, p->cur, 1)) {
+                parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
+                p->cur = p->end;
+                return;
+            }
+            p->quoted_field_buffered = true;
+            p->cur++;
+            segment_start = p->cur;
+        } else {
+            yield_quoted_field(p);
+            p->state = S_NORMAL;
+            p->quoted_field_start = NULL;
+            p->quoted_field_buffered = false;
+            p->quoted_pending_quote = false;
+            consume_post_quoted_delimiter(p);
+            return;
+        }
+    }
 
     if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
         segment_start = p->cur;
@@ -555,21 +777,21 @@ static inline void consume_quoted_field(cisv_parser *p) {
             }
 
             if (special + 1 >= p->end) {
-                if (!append_to_quote_buffer(p, special, 1)) {
-                    if (p->ecb) {
-                        p->ecb(p->user, p->line_num, "Quoted field buffer allocation failed");
+                if (p->streaming_mode) {
+                    if (!append_to_quote_buffer(p, special, 1)) {
+                        parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
+                    } else {
+                        p->quoted_field_buffered = true;
                     }
                 } else {
-                    p->quoted_field_buffered = true;
+                    parser_report_error(p, p->line_num + 1, "Malformed escape at EOF");
                 }
                 p->cur = p->end;
                 return;
             }
 
             if (!append_to_quote_buffer(p, special + 1, 1)) {
-                if (p->ecb) {
-                    p->ecb(p->user, p->line_num, "Quoted field buffer allocation failed");
-                }
+                parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
                 p->cur = p->end;
                 return;
             }
@@ -586,9 +808,7 @@ static inline void consume_quoted_field(cisv_parser *p) {
                 return;
             }
             if (!append_to_quote_buffer(p, special, 1)) {
-                if (p->ecb) {
-                    p->ecb(p->user, p->line_num, "Quoted field buffer allocation failed");
-                }
+                parser_report_error(p, p->line_num + 1, "Quoted field buffer allocation failed");
                 p->cur = p->end;
                 return;
             }
@@ -596,6 +816,17 @@ static inline void consume_quoted_field(cisv_parser *p) {
             p->cur = special + 2;
             segment_start = p->cur;
             continue;
+        }
+
+        if (p->streaming_mode && special + 1 >= p->end) {
+            if (!append_current_quoted_segment(p, segment_start, special)) {
+                p->cur = p->end;
+                return;
+            }
+            p->quoted_pending_quote = true;
+            p->quoted_field_buffered = true;
+            p->cur = p->end;
+            return;
         }
 
         if (p->quoted_field_buffered) {
@@ -612,6 +843,7 @@ static inline void consume_quoted_field(cisv_parser *p) {
         p->cur = special + 1;
         p->quoted_field_start = NULL;
         p->quoted_field_buffered = false;
+        p->quoted_pending_quote = false;
         consume_post_quoted_delimiter(p);
         return;
     }
@@ -621,18 +853,27 @@ static inline void consume_quoted_field(cisv_parser *p) {
 // We cannot call yield_field() directly here because it would re-append data
 // to stream_buffer while streaming_mode is enabled.
 static inline void yield_stream_buffer_field(cisv_parser *p) {
-    if (!p->fcb || p->stream_buffer_pos == 0) return;
+    if (p->stream_buffer_pos == 0) return;
 
     const uint8_t *start = p->stream_buffer;
     const uint8_t *end = p->stream_buffer + p->stream_buffer_pos;
+    bool emit_field = p->fcb && row_in_emit_range(p);
 
     if (__builtin_expect(p->trim, 0)) {
         while (start < end && __builtin_expect(is_ws(*start), 0)) start++;
         while (start < end && __builtin_expect(is_ws(*(end-1)), 0)) end--;
     }
 
-    if (__builtin_expect(start < end || !p->skip_empty_lines, 1)) {
-        p->fcb(p->user, (const char*)start, end - start);
+    if (start < end) {
+        if (emit_field) {
+            p->fcb(p->user, (const char*)start, end - start);
+        }
+        p->fields++;
+        p->current_row_fields++;
+    } else if (!p->skip_empty_lines) {
+        if (emit_field) {
+            p->fcb(p->user, (const char*)start, 0);
+        }
         p->fields++;
         p->current_row_fields++;
     }
@@ -773,8 +1014,7 @@ static void parse_avx512(cisv_parser *p) {
                     if (field_end > p->field_start && *(field_end - 1) == '\r') {
                         field_end--;
                     }
-                    yield_field(p, p->field_start, field_end);
-                    yield_row(p);
+                    yield_line_end(p, field_end);
                     p->field_start = ptr + 1;
                 } else if (quote_mask & (1ULL << pos)) {
                     if (ptr == p->field_start) {
@@ -783,6 +1023,7 @@ static void parse_avx512(cisv_parser *p) {
                         p->quote_buffer_pos = 0;
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
+                        p->quoted_pending_quote = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -812,14 +1053,14 @@ static void parse_avx512(cisv_parser *p) {
                 if (field_end > p->field_start && *(field_end - 1) == '\r') {
                     field_end--;
                 }
-                yield_field(p, p->field_start, field_end);
-                yield_row(p);
+                yield_line_end(p, field_end);
                 p->field_start = p->cur;
             } else if (c == p->quote && p->cur - 1 == p->field_start) {
                 p->state = S_QUOTED;
                 p->quote_buffer_pos = 0;
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
+                p->quoted_pending_quote = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -828,13 +1069,14 @@ static void parse_avx512(cisv_parser *p) {
         }
     }
 
-    if (!p->streaming_mode && p->state == S_NORMAL && p->field_start < p->end) {
-        yield_field(p, p->field_start, p->end);
+    if (!p->streaming_mode && p->state == S_NORMAL) {
+        if (p->field_start < p->end ||
+            (p->field_start == p->end && p->current_row_fields > 0)) {
+            yield_field(p, p->field_start, p->end);
+        }
     } else if (!p->streaming_mode && p->state == S_QUOTED) {
         // SECURITY: Report unterminated quote at EOF
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
-        }
+        parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
         // Still yield the partial content so data isn't lost
         if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
             yield_quoted_field(p);
@@ -893,8 +1135,7 @@ static void parse_avx2(cisv_parser *p) {
                     if (field_end > p->field_start && *(field_end - 1) == '\r') {
                         field_end--;
                     }
-                    yield_field(p, p->field_start, field_end);
-                    yield_row(p);
+                    yield_line_end(p, field_end);
                     p->field_start = ptr + 1;
                 } else if (c == p->quote) {
                     if (ptr == p->field_start) {
@@ -903,6 +1144,7 @@ static void parse_avx2(cisv_parser *p) {
                         p->quote_buffer_pos = 0;
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
+                        p->quoted_pending_quote = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -932,14 +1174,14 @@ static void parse_avx2(cisv_parser *p) {
                 if (field_end > p->field_start && *(field_end - 1) == '\r') {
                     field_end--;
                 }
-                yield_field(p, p->field_start, field_end);
-                yield_row(p);
+                yield_line_end(p, field_end);
                 p->field_start = p->cur;
             } else if (c == p->quote && p->cur - 1 == p->field_start) {
                 p->state = S_QUOTED;
                 p->quote_buffer_pos = 0;
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
+                p->quoted_pending_quote = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -948,13 +1190,14 @@ static void parse_avx2(cisv_parser *p) {
         }
     }
 
-    if (!p->streaming_mode && p->state == S_NORMAL && p->field_start < p->end) {
-        yield_field(p, p->field_start, p->end);
+    if (!p->streaming_mode && p->state == S_NORMAL) {
+        if (p->field_start < p->end ||
+            (p->field_start == p->end && p->current_row_fields > 0)) {
+            yield_field(p, p->field_start, p->end);
+        }
     } else if (!p->streaming_mode && p->state == S_QUOTED) {
         // SECURITY: Report unterminated quote at EOF
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
-        }
+        parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
         // Still yield the partial content so data isn't lost
         if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
             yield_quoted_field(p);
@@ -1020,8 +1263,7 @@ static void parse_neon(cisv_parser *p) {
                     if (field_end > p->field_start && *(field_end - 1) == '\r') {
                         field_end--;
                     }
-                    yield_field(p, p->field_start, field_end);
-                    yield_row(p);
+                    yield_line_end(p, field_end);
                     p->cur++;
                     p->field_start = p->cur;
                 } else if (c == p->quote && p->cur == p->field_start) {
@@ -1030,6 +1272,7 @@ static void parse_neon(cisv_parser *p) {
                     p->quote_buffer_pos = 0;
                     p->quoted_field_start = p->cur;
                     p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
                     consume_quoted_field(p);
                     break;
                 } else {
@@ -1058,14 +1301,14 @@ static void parse_neon(cisv_parser *p) {
                 if (field_end > p->field_start && *(field_end - 1) == '\r') {
                     field_end--;
                 }
-                yield_field(p, p->field_start, field_end);
-                yield_row(p);
+                yield_line_end(p, field_end);
                 p->field_start = p->cur;
             } else if (c == p->quote && p->cur - 1 == p->field_start) {
                 p->state = S_QUOTED;
                 p->quote_buffer_pos = 0;
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
+                p->quoted_pending_quote = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1074,12 +1317,13 @@ static void parse_neon(cisv_parser *p) {
         }
     }
 
-    if (!p->streaming_mode && p->state == S_NORMAL && p->field_start < p->end) {
-        yield_field(p, p->field_start, p->end);
-    } else if (!p->streaming_mode && p->state == S_QUOTED) {
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
+    if (!p->streaming_mode && p->state == S_NORMAL) {
+        if (p->field_start < p->end ||
+            (p->field_start == p->end && p->current_row_fields > 0)) {
+            yield_field(p, p->field_start, p->end);
         }
+    } else if (!p->streaming_mode && p->state == S_QUOTED) {
+        parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
         if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
             yield_quoted_field(p);
         } else if (p->quoted_field_start && p->quoted_field_start < p->end) {
@@ -1136,8 +1380,7 @@ static void parse_sse2(cisv_parser *p) {
                     if (field_end > p->field_start && *(field_end - 1) == '\r') {
                         field_end--;
                     }
-                    yield_field(p, p->field_start, field_end);
-                    yield_row(p);
+                    yield_line_end(p, field_end);
                     p->field_start = ptr + 1;
                 } else if (c == p->quote) {
                     if (ptr == p->field_start) {
@@ -1146,6 +1389,7 @@ static void parse_sse2(cisv_parser *p) {
                         p->quote_buffer_pos = 0;
                         p->quoted_field_start = p->cur;
                         p->quoted_field_buffered = false;
+                        p->quoted_pending_quote = false;
                         consume_quoted_field(p);
                         break;
                     }
@@ -1175,14 +1419,14 @@ static void parse_sse2(cisv_parser *p) {
                 if (field_end > p->field_start && *(field_end - 1) == '\r') {
                     field_end--;
                 }
-                yield_field(p, p->field_start, field_end);
-                yield_row(p);
+                yield_line_end(p, field_end);
                 p->field_start = p->cur;
             } else if (c == p->quote && p->cur - 1 == p->field_start) {
                 p->state = S_QUOTED;
                 p->quote_buffer_pos = 0;
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
+                p->quoted_pending_quote = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1191,12 +1435,13 @@ static void parse_sse2(cisv_parser *p) {
         }
     }
 
-    if (!p->streaming_mode && p->state == S_NORMAL && p->field_start < p->end) {
-        yield_field(p, p->field_start, p->end);
-    } else if (!p->streaming_mode && p->state == S_QUOTED) {
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
+    if (!p->streaming_mode && p->state == S_NORMAL) {
+        if (p->field_start < p->end ||
+            (p->field_start == p->end && p->current_row_fields > 0)) {
+            yield_field(p, p->field_start, p->end);
         }
+    } else if (!p->streaming_mode && p->state == S_QUOTED) {
+        parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
         if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
             yield_quoted_field(p);
         } else if (p->quoted_field_start && p->quoted_field_start < p->end) {
@@ -1244,8 +1489,7 @@ static void parse_scalar(cisv_parser *p) {
                     if (field_end > p->field_start && *(field_end - 1) == '\r') {
                         field_end--;
                     }
-                    yield_field(p, p->field_start, field_end);
-                    yield_row(p);
+                    yield_line_end(p, field_end);
                     p->cur++;
                     p->field_start = p->cur;
                 } else if (c == p->quote && p->cur == p->field_start) {
@@ -1254,6 +1498,7 @@ static void parse_scalar(cisv_parser *p) {
                     p->quote_buffer_pos = 0;
                     p->quoted_field_start = p->cur;
                     p->quoted_field_buffered = false;
+                    p->quoted_pending_quote = false;
                     consume_quoted_field(p);
                     break;
                 } else {
@@ -1281,14 +1526,14 @@ static void parse_scalar(cisv_parser *p) {
                 if (field_end > p->field_start && *(field_end - 1) == '\r') {
                     field_end--;
                 }
-                yield_field(p, p->field_start, field_end);
-                yield_row(p);
+                yield_line_end(p, field_end);
                 p->field_start = p->cur;
             } else if (c == p->quote && p->cur - 1 == p->field_start) {
                 p->state = S_QUOTED;
                 p->quote_buffer_pos = 0;
                 p->quoted_field_start = p->cur;
                 p->quoted_field_buffered = false;
+                p->quoted_pending_quote = false;
                 consume_quoted_field(p);
             }
         } else if (p->state == S_QUOTED) {
@@ -1297,13 +1542,14 @@ static void parse_scalar(cisv_parser *p) {
         }
     }
 
-    if (!p->streaming_mode && p->state == S_NORMAL && p->field_start < p->end) {
-        yield_field(p, p->field_start, p->end);
+    if (!p->streaming_mode && p->state == S_NORMAL) {
+        if (p->field_start < p->end ||
+            (p->field_start == p->end && p->current_row_fields > 0)) {
+            yield_field(p, p->field_start, p->end);
+        }
     } else if (!p->streaming_mode && p->state == S_QUOTED) {
         // SECURITY: Report unterminated quote at EOF
-        if (p->ecb) {
-            p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
-        }
+        parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
         // Still yield the partial content so data isn't lost
         if (p->quoted_field_buffered && p->quote_buffer_pos > 0) {
             yield_quoted_field(p);
@@ -1318,38 +1564,10 @@ static void parse_scalar(cisv_parser *p) {
 }
 
 cisv_parser *cisv_parser_create_with_config(const cisv_config *config) {
-    if (!config) return NULL;
+    if (!cisv_config_is_valid(config)) return NULL;
 
-    // SECURITY: Validate configuration to prevent parsing ambiguities
-    // Delimiter cannot be the same as quote character
-    if (config->delimiter == config->quote) {
-        return NULL;  // Invalid configuration
-    }
-
-    // Delimiter cannot be a newline character (would break row detection)
-    if (config->delimiter == '\n' || config->delimiter == '\r') {
-        return NULL;  // Invalid configuration
-    }
-
-    // Quote character cannot be a newline character
-    if (config->quote == '\n' || config->quote == '\r') {
-        return NULL;  // Invalid configuration
-    }
-
-    // Escape character validation (if set)
-    if (config->escape != '\0') {
-        if (config->escape == '\n' || config->escape == '\r') {
-            return NULL;  // Invalid configuration
-        }
-        if (config->escape == config->delimiter) {
-            return NULL;  // Invalid configuration
-        }
-    }
-
-    cisv_parser *p = (cisv_parser*)aligned_alloc(CACHE_LINE_SIZE, sizeof(*p));
+    cisv_parser *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
-
-    memset(p, 0, sizeof(*p));
 
     p->delimiter = config->delimiter;
     p->quote = config->quote;
@@ -1357,11 +1575,21 @@ cisv_parser *cisv_parser_create_with_config(const cisv_config *config) {
     p->trim = config->trim;
     p->skip_empty_lines = config->skip_empty_lines;
     p->comment = config->comment;
-    p->from_line = config->from_line;
+    p->from_line = config->from_line > 0 ? config->from_line : 1;
     p->to_line = config->to_line;
-    p->max_row_size = config->max_row_size;
+    p->memory_budget = cisv_runtime_memory_budget();
+    size_t env_row_limit = cisv_runtime_max_row_size();
+    if (config->max_row_size > 0) {
+        p->max_row_size = config->max_row_size;
+    } else if (env_row_limit > 0) {
+        p->max_row_size = env_row_limit;
+    } else {
+        p->max_row_size = cisv_adaptive_row_limit(p->memory_budget);
+    }
     p->skip_lines_with_error = config->skip_lines_with_error;
-    p->has_row_controls = (config->max_row_size > 0 || config->comment != 0);
+    p->has_row_controls = (p->max_row_size > 0 || config->comment != 0);
+    p->relaxed = config->relaxed;
+    p->had_error = false;
 
     p->fcb = config->field_cb;
     p->rcb = config->row_cb;
@@ -1370,25 +1598,26 @@ cisv_parser *cisv_parser_create_with_config(const cisv_config *config) {
 
     p->fd = -1;
     p->line_num = 0;
+    p->had_error = false;
     p->current_row_fields = 0;
     p->current_row_size = 0;
     p->skip_current_row = false;
     p->row_is_comment = false;
     p->parse_impl = NULL;
 
-    // Allocate quote buffer with cache-line alignment for SIMD access
-    // Start at 64KB to avoid early reallocations and match MIN_BUFFER_INCREMENT
+    // Start at 64KB to avoid early reallocations and match MIN_BUFFER_INCREMENT.
+    // These buffers are grown with realloc(), so use malloc-family allocation.
     p->quote_buffer_size = MIN_BUFFER_INCREMENT;
-    p->quote_buffer = aligned_alloc(CACHE_LINE_SIZE, p->quote_buffer_size);
+    p->quote_buffer = malloc(p->quote_buffer_size);
     if (!p->quote_buffer) {
         free(p);
         return NULL;
     }
     p->quote_buffer_pos = 0;
 
-    // Allocate stream buffer for streaming mode (cache-line aligned, 64KB)
+    // Allocate stream buffer for streaming mode.
     p->stream_buffer_size = MIN_BUFFER_INCREMENT;
-    p->stream_buffer = aligned_alloc(CACHE_LINE_SIZE, p->stream_buffer_size);
+    p->stream_buffer = malloc(p->stream_buffer_size);
     if (!p->stream_buffer) {
         free(p->quote_buffer);
         free(p);
@@ -1486,6 +1715,7 @@ int cisv_parser_parse_file(cisv_parser *p, const char *path) {
     p->quote_buffer_pos = 0;
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
+    p->quoted_pending_quote = false;
     p->stream_buffer_pos = 0;
     p->streaming_mode = false;
     p->current_row_size = 0;
@@ -1495,6 +1725,8 @@ int cisv_parser_parse_file(cisv_parser *p, const char *path) {
     // Runtime ISA dispatch with scalar fallback.
     parse_dispatch(p);
 
+    int result = p->had_error ? -EINVAL : 0;
+
     // Release file resources immediately after parse to avoid descriptor
     // retention when parser objects are reused.
     munmap(p->base, p->size);
@@ -1503,7 +1735,7 @@ int cisv_parser_parse_file(cisv_parser *p, const char *path) {
     close(p->fd);
     p->fd = -1;
 
-    return 0;
+    return result;
 }
 
 typedef struct {
@@ -1570,7 +1802,15 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
         cisv_config_init(&effective_config);
     }
 
-    int fd = open(path, O_RDONLY);
+    bool fast_count_allowed =
+        !effective_config.skip_empty_lines &&
+        effective_config.comment == 0 &&
+        effective_config.from_line <= 1 &&
+        effective_config.to_line == 0 &&
+        effective_config.max_row_size == 0 &&
+        !effective_config.skip_lines_with_error;
+
+    int fd = fast_count_allowed ? open(path, O_RDONLY) : -1;
     if (fd >= 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && st.st_size > 0) {
@@ -1620,6 +1860,10 @@ size_t cisv_parser_count_rows_with_config(const char *path, const cisv_config *c
 int cisv_parser_write(cisv_parser *p, const uint8_t *chunk, size_t len) {
     if (!p || (!chunk && len > 0)) return -EINVAL;
 
+    if (!p->streaming_mode) {
+        p->had_error = false;
+    }
+
     // Enable streaming mode - fields may span chunks
     p->streaming_mode = true;
 
@@ -1635,23 +1879,34 @@ int cisv_parser_write(cisv_parser *p, const uint8_t *chunk, size_t len) {
         // We have a partial field - buffer it for the next write() call
         size_t partial_len = p->cur - p->field_start;
         if (partial_len > 0) {
-            append_to_stream_buffer(p, p->field_start, partial_len);
+            if (!append_to_stream_buffer(p, p->field_start, partial_len)) {
+                return -ENOMEM;
+            }
         }
     }
 
-    return 0;
+    return p->had_error ? -EINVAL : 0;
 }
 
 void cisv_parser_end(cisv_parser *p) {
     if (!p) return;
 
     if (p->streaming_mode) {
+        bool finalized_pending_quote = false;
+        if (p->state == S_QUOTED && p->quoted_pending_quote) {
+            p->quoted_pending_quote = false;
+            yield_quoted_field(p);
+            p->state = S_NORMAL;
+            p->quoted_field_start = NULL;
+            p->quoted_field_buffered = false;
+            finalized_pending_quote = true;
+        }
         if (p->state == S_NORMAL && p->stream_buffer_pos > 0) {
             yield_stream_buffer_field(p);
+        } else if (p->state == S_NORMAL && p->current_row_fields > 0 && !finalized_pending_quote) {
+            yield_field(p, p->cur, p->cur);
         } else if (p->state == S_QUOTED && p->quote_buffer_pos > 0) {
-            if (p->ecb) {
-                p->ecb(p->user, p->line_num, "Unterminated quoted field at EOF");
-            }
+            parser_report_error(p, p->line_num + 1, "Unterminated quoted field at EOF");
             yield_quoted_field(p);
         }
         if (p->current_row_fields > 0) {
@@ -1661,7 +1916,9 @@ void cisv_parser_end(cisv_parser *p) {
         return;
     }
 
-    if (p->state == S_NORMAL && p->field_start && p->field_start < p->cur) {
+    if (p->state == S_NORMAL && p->field_start &&
+        (p->field_start < p->cur ||
+         (p->field_start == p->cur && p->current_row_fields > 0))) {
         yield_field(p, p->field_start, p->cur);
     } else if (p->state == S_QUOTED && p->quote_buffer_pos > 0) {
         yield_quoted_field(p);
@@ -1863,9 +2120,11 @@ int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
     p->end = chunk->end;
     p->field_start = p->cur;
     p->state = S_NORMAL;
+    p->had_error = false;
     p->quote_buffer_pos = 0;
     p->quoted_field_start = NULL;
     p->quoted_field_buffered = false;
+    p->quoted_pending_quote = false;
     p->current_row_fields = 0;
     p->current_row_size = 0;
     p->skip_current_row = false;
@@ -1873,7 +2132,7 @@ int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
 
     parse_dispatch(p);
 
-    return 0;
+    return p->had_error ? -EINVAL : 0;
 }
 
 // =============================================================================
@@ -1894,14 +2153,20 @@ typedef struct {
 
 // Ensure result has capacity for more rows
 static inline bool batch_ensure_rows(cisv_result_t *r, size_t needed) {
-    if (r->row_count + needed <= r->row_capacity) return true;
+    size_t required;
+    if (__builtin_add_overflow(r->row_count, needed, &required)) return false;
+    if (required <= r->row_capacity) return true;
 
     // 1.5x growth: reduces memory waste from ~50% to ~33%
-    size_t required = r->row_count + needed;
     size_t new_cap = r->row_capacity + (r->row_capacity >> 1);
     if (new_cap < required) new_cap = required;
 
-    cisv_row_t *new_rows = realloc(r->rows, new_cap * sizeof(cisv_row_t));
+    size_t alloc_size;
+    if (__builtin_mul_overflow(new_cap, sizeof(cisv_row_t), &alloc_size)) return false;
+    size_t budget = cisv_runtime_memory_budget();
+    if (budget > 0 && alloc_size > budget) return false;
+
+    cisv_row_t *new_rows = realloc(r->rows, alloc_size);
     if (!new_rows) return false;
 
     r->rows = new_rows;
@@ -1911,17 +2176,28 @@ static inline bool batch_ensure_rows(cisv_result_t *r, size_t needed) {
 
 // Ensure result has capacity for more fields
 static inline bool batch_ensure_fields(cisv_result_t *r, size_t needed) {
-    if (r->total_fields + needed <= r->fields_capacity) return true;
+    size_t required;
+    if (__builtin_add_overflow(r->total_fields, needed, &required)) return false;
+    if (required <= r->fields_capacity) return true;
 
     // 1.5x growth: reduces memory waste from ~50% to ~33%
-    size_t required = r->total_fields + needed;
     size_t new_cap = r->fields_capacity + (r->fields_capacity >> 1);
     if (new_cap < required) new_cap = required;
 
-    char **new_fields = realloc(r->all_fields, new_cap * sizeof(char*));
+    size_t fields_bytes;
+    size_t lengths_bytes;
+    if (__builtin_mul_overflow(new_cap, sizeof(char*), &fields_bytes)) return false;
+    if (__builtin_mul_overflow(new_cap, sizeof(size_t), &lengths_bytes)) return false;
+    size_t budget = cisv_runtime_memory_budget();
+    if (budget > 0 && (fields_bytes > budget || lengths_bytes > budget ||
+                       fields_bytes > budget - lengths_bytes)) {
+        return false;
+    }
+
+    char **new_fields = realloc(r->all_fields, fields_bytes);
     if (!new_fields) return false;
 
-    size_t *new_lengths = realloc(r->all_lengths, new_cap * sizeof(size_t));
+    size_t *new_lengths = realloc(r->all_lengths, lengths_bytes);
     if (!new_lengths) {
         // Preserve the successful realloc result so ownership is not lost
         // if the second growth step fails.
@@ -1940,15 +2216,19 @@ static inline bool batch_ensure_fields(cisv_result_t *r, size_t needed) {
 // O(n) pointer fixup on reallocation. Offsets are converted to pointers
 // in batch_result_finalize() after parsing completes.
 static inline bool batch_ensure_data(cisv_result_t *r, size_t needed) {
-    if (r->field_data_size + needed <= r->field_data_capacity) return true;
+    size_t required;
+    if (__builtin_add_overflow(r->field_data_size, needed, &required)) return false;
+    if (required <= r->field_data_capacity) return true;
 
     // 1.5x growth: reduces memory waste from ~50% to ~33%
-    size_t required = r->field_data_size + needed;
     size_t new_cap = r->field_data_capacity + (r->field_data_capacity >> 1);
     if (new_cap < required) new_cap = required;
 
     // Round up to 64-byte alignment for cache efficiency
+    if (new_cap > SIZE_MAX - 63) return false;
     new_cap = (new_cap + 63) & ~(size_t)63;
+    size_t budget = cisv_runtime_memory_budget();
+    if (budget > 0 && new_cap > budget) return false;
 
     char *new_data = realloc(r->field_data, new_cap);
     if (!new_data) return false;
@@ -2088,10 +2368,40 @@ static cisv_result_t *batch_result_create_with_hint(size_t file_size_hint) {
         data_cap = (data_cap + 63) & ~(size_t)63;
     }
 
+    size_t memory_budget = cisv_runtime_memory_budget();
+    if (memory_budget > 0) {
+        size_t row_budget = memory_budget / 8;
+        size_t field_budget = memory_budget / 4;
+        size_t data_budget = memory_budget / 2;
+
+        size_t max_rows = row_budget / sizeof(cisv_row_t);
+        if (max_rows > 0 && row_cap > max_rows) row_cap = max_rows;
+        if (row_cap < 128) row_cap = 128;
+
+        size_t field_slot_size = sizeof(char*) + sizeof(size_t);
+        size_t max_fields = field_slot_size ? field_budget / field_slot_size : 0;
+        if (max_fields > 0 && field_cap > max_fields) field_cap = max_fields;
+        if (field_cap < 512) field_cap = 512;
+
+        if (data_budget > 0 && data_cap > data_budget) data_cap = data_budget;
+        if (data_cap < 64 * 1024) data_cap = 64 * 1024;
+        data_cap = (data_cap + 63) & ~(size_t)63;
+    }
+
+    size_t rows_bytes;
+    size_t fields_bytes;
+    size_t lengths_bytes;
+    if (__builtin_mul_overflow(row_cap, sizeof(cisv_row_t), &rows_bytes) ||
+        __builtin_mul_overflow(field_cap, sizeof(char*), &fields_bytes) ||
+        __builtin_mul_overflow(field_cap, sizeof(size_t), &lengths_bytes)) {
+        free(r);
+        return NULL;
+    }
+
     // Allocate buffers with estimated sizes
-    r->rows = malloc(row_cap * sizeof(cisv_row_t));
-    r->all_fields = malloc(field_cap * sizeof(char*));
-    r->all_lengths = malloc(field_cap * sizeof(size_t));
+    r->rows = malloc(rows_bytes);
+    r->all_fields = malloc(fields_bytes);
+    r->all_lengths = malloc(lengths_bytes);
     r->field_data = malloc(data_cap);
 
     if (!r->rows || !r->all_fields || !r->all_lengths || !r->field_data) {
@@ -2315,10 +2625,31 @@ cisv_result_t **cisv_parse_file_parallel(const char *path, const cisv_config *co
     // Limit to reasonable maximum
     if (num_threads > 64) num_threads = 64;
 
+    int proc_cap = cisv_runtime_max_procs();
+    if (proc_cap > 0 && num_threads > proc_cap) {
+        num_threads = proc_cap;
+    }
+    if (num_threads < 1) num_threads = 1;
+
     // Memory-map the file
     cisv_mmap_file_t *mmap_file = cisv_mmap_open(path);
     if (!mmap_file) {
         return NULL;
+    }
+
+    size_t parallel_min_bytes = cisv_runtime_parallel_min_bytes();
+    if (parallel_min_bytes > 0 && mmap_file->size < parallel_min_bytes) {
+        num_threads = 1;
+    }
+
+    size_t memory_budget = cisv_runtime_memory_budget();
+    if (memory_budget > 0) {
+        size_t min_per_thread = 256 * 1024;
+        size_t memory_thread_cap = memory_budget / min_per_thread;
+        if (memory_thread_cap == 0) memory_thread_cap = 1;
+        if ((size_t)num_threads > memory_thread_cap) {
+            num_threads = (int)memory_thread_cap;
+        }
     }
 
     // Split into chunks
@@ -2458,6 +2789,8 @@ struct cisv_iterator {
     char quote;
     bool trim;
     bool skip_empty_lines;
+    size_t max_row_size;
+    size_t current_row_size;
 
     // Quote buffer for escaped quotes
     uint8_t *quote_buffer;
@@ -2471,16 +2804,27 @@ struct cisv_iterator {
 
 // Ensure iterator has capacity for more fields
 static inline bool iter_ensure_fields(cisv_iterator_t *it, size_t needed) {
-    size_t required = it->field_count + needed;
+    size_t required;
+    if (__builtin_add_overflow(it->field_count, needed, &required)) return false;
     if (required <= it->field_capacity) return true;
 
     size_t new_cap = it->field_capacity + (it->field_capacity >> 1);
     if (new_cap < required) new_cap = required;
 
-    char **new_fields = realloc(it->fields, new_cap * sizeof(char*));
+    size_t fields_bytes;
+    size_t lengths_bytes;
+    if (__builtin_mul_overflow(new_cap, sizeof(char*), &fields_bytes)) return false;
+    if (__builtin_mul_overflow(new_cap, sizeof(size_t), &lengths_bytes)) return false;
+    size_t budget = cisv_runtime_memory_budget();
+    if (budget > 0 && (fields_bytes > budget || lengths_bytes > budget ||
+                       fields_bytes > budget - lengths_bytes)) {
+        return false;
+    }
+
+    char **new_fields = realloc(it->fields, fields_bytes);
     if (!new_fields) return false;
 
-    size_t *new_lengths = realloc(it->lengths, new_cap * sizeof(size_t));
+    size_t *new_lengths = realloc(it->lengths, lengths_bytes);
     if (!new_lengths) {
         it->fields = new_fields;  // Keep the successful realloc
         return false;
@@ -2494,12 +2838,18 @@ static inline bool iter_ensure_fields(cisv_iterator_t *it, size_t needed) {
 
 // Ensure iterator has capacity for more field data
 static inline bool iter_ensure_data(cisv_iterator_t *it, size_t needed) {
-    size_t required = it->field_data_len + needed + 1;  // +1 for null terminator
+    size_t with_nul;
+    size_t required;
+    if (__builtin_add_overflow(needed, 1, &with_nul)) return false;
+    if (__builtin_add_overflow(it->field_data_len, with_nul, &required)) return false;
     if (required <= it->field_data_cap) return true;
 
     size_t new_cap = it->field_data_cap + (it->field_data_cap >> 1);
     if (new_cap < required) new_cap = required;
+    if (new_cap > SIZE_MAX - 63) return false;
     new_cap = (new_cap + 63) & ~(size_t)63;  // Align to 64 bytes
+    size_t budget = cisv_runtime_memory_budget();
+    if (budget > 0 && new_cap > budget) return false;
 
     char *new_data = realloc(it->field_data, new_cap);
     if (!new_data) return false;
@@ -2519,12 +2869,13 @@ static inline bool iter_ensure_data(cisv_iterator_t *it, size_t needed) {
 
 // Ensure quote buffer has space
 static inline bool iter_ensure_quote_buffer(cisv_iterator_t *it, size_t needed) {
-    size_t required = it->quote_buffer_pos + needed;
+    size_t required;
+    if (__builtin_add_overflow(it->quote_buffer_pos, needed, &required)) return false;
     if (required <= it->quote_buffer_size) return true;
 
     size_t new_size = it->quote_buffer_size + (it->quote_buffer_size >> 1);
     if (new_size < required) new_size = required;
-    if (new_size > MAX_QUOTE_BUFFER_SIZE) return false;
+    if (new_size > cisv_buffer_limit_from_budget(cisv_runtime_memory_budget())) return false;
 
     uint8_t *new_buf = realloc(it->quote_buffer, new_size);
     if (!new_buf) return false;
@@ -2536,8 +2887,26 @@ static inline bool iter_ensure_quote_buffer(cisv_iterator_t *it, size_t needed) 
 
 // Add a field to current row
 static inline bool iter_add_field(cisv_iterator_t *it, const uint8_t *start, size_t len) {
-    if (!iter_ensure_fields(it, 1)) return false;
-    if (!iter_ensure_data(it, len)) return false;
+    if (it->max_row_size > 0) {
+        size_t with_delimiter;
+        size_t next_size;
+        if (__builtin_add_overflow(len, 1, &with_delimiter) ||
+            __builtin_add_overflow(it->current_row_size, with_delimiter, &next_size) ||
+            next_size > it->max_row_size) {
+            it->error_code = EOVERFLOW;
+            return false;
+        }
+        it->current_row_size = next_size;
+    }
+
+    if (!iter_ensure_fields(it, 1)) {
+        it->error_code = ENOMEM;
+        return false;
+    }
+    if (!iter_ensure_data(it, len)) {
+        it->error_code = ENOMEM;
+        return false;
+    }
 
     // Copy field data
     char *field_ptr = it->field_data + it->field_data_len;
@@ -2588,6 +2957,11 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->eof = true;
         it->delimiter = config ? config->delimiter : ',';
         it->quote = config ? config->quote : '"';
+        size_t memory_budget = cisv_runtime_memory_budget();
+        size_t env_row_limit = cisv_runtime_max_row_size();
+        it->max_row_size = config && config->max_row_size > 0
+            ? config->max_row_size
+            : (env_row_limit > 0 ? env_row_limit : cisv_adaptive_row_limit(memory_budget));
         return it;
     }
 
@@ -2626,11 +3000,17 @@ cisv_iterator_t *cisv_iterator_open(const char *path, const cisv_config *config)
         it->quote = config->quote;
         it->trim = config->trim;
         it->skip_empty_lines = config->skip_empty_lines;
+        size_t memory_budget = cisv_runtime_memory_budget();
+        size_t env_row_limit = cisv_runtime_max_row_size();
+        it->max_row_size = config->max_row_size > 0
+            ? config->max_row_size
+            : (env_row_limit > 0 ? env_row_limit : cisv_adaptive_row_limit(memory_budget));
     } else {
         it->delimiter = ',';
         it->quote = '"';
         it->trim = false;
         it->skip_empty_lines = false;
+        it->max_row_size = cisv_adaptive_row_limit(cisv_runtime_memory_budget());
     }
 
     // Allocate initial buffers
@@ -2671,6 +3051,7 @@ int cisv_iterator_next(cisv_iterator_t *it,
     // Reset row state
     it->field_count = 0;
     it->field_data_len = 0;
+    it->current_row_size = 0;
 
 restart_row:
     if (it->pos >= it->end) {
@@ -2696,7 +3077,7 @@ restart_row:
                     iter_trim_field(&field_start, &field_end);
                 }
                 if (!iter_add_field(it, field_start, field_end - field_start)) {
-                    it->error_code = ENOMEM;
+                    if (it->error_code == 0) it->error_code = ENOMEM;
                     return CISV_ITER_ERROR;
                 }
                 it->pos++;
@@ -2712,7 +3093,7 @@ restart_row:
                     iter_trim_field(&field_start, &field_end);
                 }
                 if (!iter_add_field(it, field_start, field_end - field_start)) {
-                    it->error_code = ENOMEM;
+                    if (it->error_code == 0) it->error_code = ENOMEM;
                     return CISV_ITER_ERROR;
                 }
                 it->pos++;
@@ -2721,6 +3102,7 @@ restart_row:
                 if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
                     it->field_count = 0;
                     it->field_data_len = 0;
+                    it->current_row_size = 0;
                     goto restart_row;
                 }
 
@@ -2745,7 +3127,7 @@ restart_row:
                 if (it->pos + 1 < it->end && *(it->pos + 1) == it->quote) {
                     // Escaped quote - add one quote to buffer
                     if (!iter_ensure_quote_buffer(it, 1)) {
-                        it->error_code = ENOMEM;
+                        if (it->error_code == 0) it->error_code = ENOMEM;
                         return CISV_ITER_ERROR;
                     }
                     it->quote_buffer[it->quote_buffer_pos++] = it->quote;
@@ -2763,7 +3145,7 @@ restart_row:
                         }
                     }
                     if (!iter_add_quoted_field(it)) {
-                        it->error_code = ENOMEM;
+                        if (it->error_code == 0) it->error_code = ENOMEM;
                         return CISV_ITER_ERROR;
                     }
                     it->state = S_NORMAL;
@@ -2781,6 +3163,7 @@ restart_row:
                             if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
                                 it->field_count = 0;
                                 it->field_data_len = 0;
+                                it->current_row_size = 0;
                                 goto restart_row;
                             }
 
@@ -2796,6 +3179,7 @@ restart_row:
                             if (it->skip_empty_lines && it->field_count == 1 && it->lengths[0] == 0) {
                                 it->field_count = 0;
                                 it->field_data_len = 0;
+                                it->current_row_size = 0;
                                 goto restart_row;
                             }
 
@@ -2811,7 +3195,7 @@ restart_row:
             } else {
                 // Regular character in quoted field
                 if (!iter_ensure_quote_buffer(it, 1)) {
-                    it->error_code = ENOMEM;
+                    if (it->error_code == 0) it->error_code = ENOMEM;
                     return CISV_ITER_ERROR;
                 }
                 it->quote_buffer[it->quote_buffer_pos++] = c;
@@ -2834,7 +3218,7 @@ restart_row:
                 }
             }
             if (!iter_add_quoted_field(it)) {
-                it->error_code = ENOMEM;
+                if (it->error_code == 0) it->error_code = ENOMEM;
                 return CISV_ITER_ERROR;
             }
         } else {
@@ -2847,7 +3231,7 @@ restart_row:
                 iter_trim_field(&field_start, &field_end);
             }
             if (!iter_add_field(it, field_start, field_end - field_start)) {
-                it->error_code = ENOMEM;
+                if (it->error_code == 0) it->error_code = ENOMEM;
                 return CISV_ITER_ERROR;
             }
         }
