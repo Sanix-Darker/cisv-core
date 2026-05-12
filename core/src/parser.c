@@ -23,7 +23,7 @@
 #include <arm_neon.h>
 #endif
 
-#if defined(__SSE2__) && !defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__SSE2__) && !defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
 #include <emmintrin.h>
 #endif
 
@@ -1882,25 +1882,37 @@ static inline bool ends_with_row_terminator(const uint8_t *data, size_t size) {
 }
 
 static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quote_char, bool *needs_fallback) {
-    size_t count = 0;
+    size_t nl_count = 0;
+    size_t cr_count = 0;
+    size_t crlf_count = 0;
     size_t i = 0;
+    bool previous_cr = false;
+    bool saw_cr = false;
 
     *needs_fallback = false;
 
-#ifdef __AVX512F__
+#if defined(__AVX512F__) && defined(__AVX512BW__)
     const __m512i nl_v = _mm512_set1_epi8('\n');
     const __m512i cr_v = _mm512_set1_epi8('\r');
     const __m512i quote_v = _mm512_set1_epi8((char)quote_char);
 
     while (i + 64 <= size) {
         __m512i chunk = _mm512_loadu_si512((const void *)(data + i));
-        __mmask64 quote_mask = _mm512_cmpeq_epi8_mask(chunk, quote_v);
-        __mmask64 cr_mask = _mm512_cmpeq_epi8_mask(chunk, cr_v);
-        if (quote_mask | cr_mask) {
+        uint64_t quote_mask = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, quote_v);
+        if (quote_mask) {
             *needs_fallback = true;
             return 0;
         }
-        count += (size_t)__builtin_popcountll((uint64_t)_mm512_cmpeq_epi8_mask(chunk, nl_v));
+        uint64_t cr_mask = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, cr_v);
+        uint64_t nl_mask = (uint64_t)_mm512_cmpeq_epi8_mask(chunk, nl_v);
+        nl_count += (size_t)__builtin_popcountll(nl_mask);
+        if (cr_mask || previous_cr) {
+            saw_cr = saw_cr || cr_mask != 0;
+            cr_count += (size_t)__builtin_popcountll(cr_mask);
+            crlf_count += (size_t)__builtin_popcountll((cr_mask << 1) & nl_mask);
+            if (previous_cr && (nl_mask & 1ULL)) crlf_count++;
+            previous_cr = (cr_mask & (1ULL << 63)) != 0;
+        }
         i += 64;
     }
 #elif defined(__AVX2__)
@@ -1911,13 +1923,22 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
     while (i + 32 <= size) {
         __m256i chunk = _mm256_loadu_si256((const __m256i *)(data + i));
         __m256i quote_cmp = _mm256_cmpeq_epi8(chunk, quote_v);
-        __m256i cr_cmp = _mm256_cmpeq_epi8(chunk, cr_v);
-        if (_mm256_movemask_epi8(_mm256_or_si256(quote_cmp, cr_cmp)) != 0) {
+        if (_mm256_movemask_epi8(quote_cmp) != 0) {
             *needs_fallback = true;
             return 0;
         }
+        __m256i cr_cmp = _mm256_cmpeq_epi8(chunk, cr_v);
         __m256i nl_cmp = _mm256_cmpeq_epi8(chunk, nl_v);
-        count += (size_t)__builtin_popcount((unsigned)_mm256_movemask_epi8(nl_cmp));
+        uint32_t cr_mask = (uint32_t)_mm256_movemask_epi8(cr_cmp);
+        uint32_t nl_mask = (uint32_t)_mm256_movemask_epi8(nl_cmp);
+        nl_count += (size_t)__builtin_popcount(nl_mask);
+        if (cr_mask || previous_cr) {
+            saw_cr = saw_cr || cr_mask != 0;
+            cr_count += (size_t)__builtin_popcount(cr_mask);
+            crlf_count += (size_t)__builtin_popcount((cr_mask << 1) & nl_mask);
+            if (previous_cr && (nl_mask & 1U)) crlf_count++;
+            previous_cr = (cr_mask & (1U << 31)) != 0;
+        }
         i += 32;
     }
 #elif defined(__SSE2__)
@@ -1928,13 +1949,22 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
     while (i + 16 <= size) {
         __m128i chunk = _mm_loadu_si128((const __m128i *)(data + i));
         __m128i quote_cmp = _mm_cmpeq_epi8(chunk, quote_v);
-        __m128i cr_cmp = _mm_cmpeq_epi8(chunk, cr_v);
-        if (_mm_movemask_epi8(_mm_or_si128(quote_cmp, cr_cmp)) != 0) {
+        if (_mm_movemask_epi8(quote_cmp) != 0) {
             *needs_fallback = true;
             return 0;
         }
+        __m128i cr_cmp = _mm_cmpeq_epi8(chunk, cr_v);
         __m128i nl_cmp = _mm_cmpeq_epi8(chunk, nl_v);
-        count += (size_t)__builtin_popcount((unsigned)_mm_movemask_epi8(nl_cmp));
+        uint32_t cr_mask = (uint32_t)_mm_movemask_epi8(cr_cmp);
+        uint32_t nl_mask = (uint32_t)_mm_movemask_epi8(nl_cmp);
+        nl_count += (size_t)__builtin_popcount(nl_mask);
+        if (cr_mask || previous_cr) {
+            saw_cr = saw_cr || cr_mask != 0;
+            cr_count += (size_t)__builtin_popcount(cr_mask);
+            crlf_count += (size_t)__builtin_popcount((cr_mask << 1) & nl_mask);
+            if (previous_cr && (nl_mask & 1U)) crlf_count++;
+            previous_cr = (cr_mask & (1U << 15)) != 0;
+        }
         i += 16;
     }
 #endif
@@ -1947,29 +1977,58 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
 
         uint64_t quote_mask0 = swar_has_byte(word0, quote_char);
         uint64_t quote_mask1 = swar_has_byte(word1, quote_char);
-        uint64_t cr_mask0 = swar_has_byte(word0, '\r');
-        uint64_t cr_mask1 = swar_has_byte(word1, '\r');
-        if (quote_mask0 | quote_mask1 | cr_mask0 | cr_mask1) {
+        if (quote_mask0 | quote_mask1) {
             *needs_fallback = true;
             return 0;
         }
 
-        count += (size_t)__builtin_popcountll(swar_has_byte(word0, '\n'));
-        count += (size_t)__builtin_popcountll(swar_has_byte(word1, '\n'));
+        uint64_t cr_mask0 = swar_has_byte(word0, '\r');
+        uint64_t nl_mask0 = swar_has_byte(word0, '\n');
+        nl_count += (size_t)__builtin_popcountll(nl_mask0);
+        if (cr_mask0 || previous_cr) {
+            saw_cr = saw_cr || cr_mask0 != 0;
+            cr_count += (size_t)__builtin_popcountll(cr_mask0);
+            crlf_count += (size_t)__builtin_popcountll((cr_mask0 << 8) & nl_mask0);
+            if (previous_cr && (nl_mask0 & 0x80ULL)) crlf_count++;
+            previous_cr = (cr_mask0 & 0x8000000000000000ULL) != 0;
+        }
+
+        uint64_t cr_mask1 = swar_has_byte(word1, '\r');
+        uint64_t nl_mask1 = swar_has_byte(word1, '\n');
+        nl_count += (size_t)__builtin_popcountll(nl_mask1);
+        if (cr_mask1 || previous_cr) {
+            saw_cr = saw_cr || cr_mask1 != 0;
+            cr_count += (size_t)__builtin_popcountll(cr_mask1);
+            crlf_count += (size_t)__builtin_popcountll((cr_mask1 << 8) & nl_mask1);
+            if (previous_cr && (nl_mask1 & 0x80ULL)) crlf_count++;
+            previous_cr = (cr_mask1 & 0x8000000000000000ULL) != 0;
+        }
         i += 16;
     }
 
     for (; i < size; i++) {
-        if (data[i] == quote_char || data[i] == '\r') {
+        uint8_t c = data[i];
+        if (c == quote_char) {
             *needs_fallback = true;
             return 0;
         }
-        if (data[i] == '\n') {
-            count++;
+        if (c == '\r') {
+            cr_count++;
+            saw_cr = true;
+            previous_cr = true;
+        } else if (c == '\n') {
+            nl_count++;
+            if (previous_cr) crlf_count++;
+            previous_cr = false;
+        } else {
+            previous_cr = false;
         }
     }
 
-    return count + !ends_with_row_terminator(data, size);
+    if (!saw_cr) {
+        return nl_count + !ends_with_row_terminator(data, size);
+    }
+    return cr_count + nl_count - crlf_count + !ends_with_row_terminator(data, size);
 }
 
 static size_t count_rows_quote_aware(const uint8_t *data, size_t size,

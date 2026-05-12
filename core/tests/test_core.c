@@ -1817,6 +1817,24 @@ void test_count_rows_cr_only_line_endings(void) {
     }
 }
 
+void test_count_rows_mixed_line_endings_no_quotes(void) {
+    TEST("count_rows fast path supports mixed LF CRLF CR endings");
+
+    const char *path = write_temp_csv("a,b\r\n1,2\n3,4\rlast,row");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 4) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 4, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_count_rows_empty_file(void) {
     TEST("count_rows empty file is zero");
 
@@ -2808,6 +2826,7 @@ int main(void) {
     test_count_rows_trimmed_comment_and_quoted_comment();
     test_count_rows_final_row_without_newline();
     test_count_rows_cr_only_line_endings();
+    test_count_rows_mixed_line_endings_no_quotes();
     test_count_rows_empty_file();
     test_count_rows_invalid_config_rejected();
     test_count_rows_malformed_quote_returns_zero();
