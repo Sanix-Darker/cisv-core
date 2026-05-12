@@ -1815,21 +1815,11 @@ int cisv_parser_parse_file(cisv_parser *p, const char *path) {
     p->size = st.st_size;
 
     int flags = MAP_PRIVATE;
-#ifdef MAP_HUGETLB
-    if (st.st_size > 2*1024*1024) flags |= MAP_HUGETLB;
-#endif
 #ifdef MAP_POPULATE
     flags |= MAP_POPULATE;
 #endif
 
     p->base = (uint8_t*)mmap(NULL, p->size, PROT_READ, flags, p->fd, 0);
-
-#ifdef MAP_HUGETLB
-    if (p->base == MAP_FAILED && (flags & MAP_HUGETLB)) {
-        flags &= ~MAP_HUGETLB;
-        p->base = (uint8_t*)mmap(NULL, p->size, PROT_READ, flags, p->fd, 0);
-    }
-#endif
 
     if (p->base == MAP_FAILED) {
         close(p->fd);
