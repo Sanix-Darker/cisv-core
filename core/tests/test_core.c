@@ -2372,6 +2372,44 @@ void test_parallel_custom_escape_chunk_split(void) {
     }
 }
 
+void test_parallel_malformed_quote_errors(void) {
+    TEST("parallel parse surfaces malformed quote errors");
+
+    const char *path = write_temp_csv("a,b\n\"a\"x,b\n");
+    if (!path) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_config config;
+    cisv_config_init(&config);
+
+    int result_count = 0;
+    cisv_result_t **results = cisv_parse_file_parallel(path, &config, 2, &result_count);
+    unlink(path);
+
+    int saw_error = 0;
+    int had_results = results != NULL;
+    if (results) {
+        for (int i = 0; i < result_count; i++) {
+            if (!results[i] || results[i]->error_code != 0) {
+                saw_error = 1;
+            }
+        }
+    }
+
+    cisv_results_free(results, result_count);
+
+    if (had_results && result_count > 0 && saw_error) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected parallel error result, got had_results=%d count=%d saw_error=%d",
+                 had_results, result_count, saw_error);
+        FAIL(buf);
+    }
+}
+
 void test_wide_multiline_json_stress(void) {
     TEST("wide multiline JSON stress");
 
@@ -2567,6 +2605,7 @@ int main(void) {
     test_max_row_size_skip_error_lines();
     test_parallel_custom_quote_chunk_split();
     test_parallel_custom_escape_chunk_split();
+    test_parallel_malformed_quote_errors();
     test_wide_multiline_json_stress();
 
     // Summary

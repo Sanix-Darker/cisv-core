@@ -2744,6 +2744,14 @@ static cisv_result_t *batch_result_create(void) {
     return batch_result_create_with_hint(0);
 }
 
+static cisv_result_t *batch_result_create_error(int code, const char *message) {
+    cisv_result_t *r = calloc(1, sizeof(cisv_result_t));
+    if (!r) return NULL;
+    r->error_code = code;
+    snprintf(r->error_message, sizeof(r->error_message), "%s", message ? message : "Parse error");
+    return r;
+}
+
 void cisv_result_free(cisv_result_t *result) {
     if (!result) return;
 
@@ -2880,7 +2888,7 @@ static void *parallel_parse_thread(void *arg) {
 
     cisv_result_t *result = batch_result_create_with_hint(parg->chunk_size_hint);
     if (!result) {
-        parg->result = NULL;
+        parg->result = batch_result_create_error(-ENOMEM, "Out of memory (result)");
         return NULL;
     }
 
@@ -2903,13 +2911,18 @@ static void *parallel_parse_thread(void *arg) {
 
     cisv_parser *parser = cisv_parser_create_with_config(&batch_config);
     if (!parser) {
-        cisv_result_free(result);
-        parg->result = NULL;
+        result->error_code = -ENOMEM;
+        snprintf(result->error_message, sizeof(result->error_message), "Out of memory (parser)");
+        parg->result = result;
         return NULL;
     }
 
-    cisv_parse_chunk(parser, parg->chunk);
+    int parse_result = cisv_parse_chunk(parser, parg->chunk);
     cisv_parser_destroy(parser);
+    if (parse_result < 0 && result->error_code == 0) {
+        result->error_code = parse_result;
+        snprintf(result->error_message, sizeof(result->error_message), "Parse error in chunk");
+    }
 
     // Convert stored indices to actual pointers now that parsing is complete
     batch_result_finalize(result);
@@ -3007,6 +3020,9 @@ cisv_result_t **cisv_parse_file_parallel(const char *path, const cisv_config *co
 
         parallel_parse_thread(&arg);
         results[0] = arg.result;
+        if (!results[0]) {
+            results[0] = batch_result_create_error(-ENOMEM, "Worker failed without a result");
+        }
 
         free(chunks);
         cisv_mmap_close(mmap_file);
@@ -3057,6 +3073,9 @@ cisv_result_t **cisv_parse_file_parallel(const char *path, const cisv_config *co
     for (int i = 0; i < chunk_count; i++) {
         pthread_join(threads[i], NULL);
         results[i] = args[i].result;
+        if (!results[i]) {
+            results[i] = batch_result_create_error(-ENOMEM, "Worker failed without a result");
+        }
     }
 
     free(args);
