@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include "cisv/parser.h"
+#include "cisv/writer.h"
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -20,8 +21,9 @@ static void usage(const char *prog) {
             "  %s parse <path>\n"
             "  %s count <path>\n"
             "  %s batch <path>\n"
-            "  %s parallel <path> <threads>\n",
-            prog, prog, prog, prog, prog, prog);
+            "  %s parallel <path> <threads>\n"
+            "  %s writer <path> <rows> <field-len> <quote-period>\n",
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int write_flat_dataset(const char *path, long rows, int cols) {
@@ -105,6 +107,65 @@ static void bench_field_cb(void *user, const char *data, size_t len) {
 static void bench_row_cb(void *user) {
     (void)user;
     parse_rows++;
+}
+
+static int bench_writer(const char *path, long rows, size_t field_len, size_t quote_period) {
+    if (rows < 0 || field_len == 0) {
+        return 1;
+    }
+
+    char *field = malloc(field_len);
+    if (!field) {
+        return 1;
+    }
+    memset(field, 'a', field_len);
+    field[0] = ',';
+    if (quote_period > 0) {
+        for (size_t i = quote_period; i < field_len; i += quote_period) {
+            field[i] = '"';
+        }
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(field);
+        return 1;
+    }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+
+    cisv_writer *writer = cisv_writer_create(f);
+    if (!writer) {
+        fclose(f);
+        free(field);
+        return 1;
+    }
+
+    double t0 = now_seconds();
+    int rc = 0;
+    for (long i = 0; i < rows; i++) {
+        if (cisv_writer_field(writer, field, field_len) != 0 ||
+            cisv_writer_row_end(writer) != 0) {
+            rc = 1;
+            break;
+        }
+    }
+    if (rc == 0 && cisv_writer_flush(writer) != 0) {
+        rc = 1;
+    }
+    double t1 = now_seconds();
+
+    size_t bytes = cisv_writer_bytes_written(writer);
+    double seconds = t1 - t0;
+    double mib = (double)bytes / (1024.0 * 1024.0);
+    printf("mode=writer rows=%ld field_len=%zu quote_period=%zu bytes=%zu seconds=%.6f mib_per_sec=%.2f\n",
+           rows, field_len, quote_period, bytes, seconds,
+           seconds > 0.0 ? mib / seconds : 0.0);
+
+    cisv_writer_destroy(writer);
+    int close_rc = fclose(f);
+    free(field);
+
+    return rc == 0 && close_rc == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -209,6 +270,17 @@ int main(int argc, char **argv) {
                rows, fields, err, result_count, t1 - t0);
         cisv_results_free(results, result_count);
         return err ? 1 : 0;
+    }
+
+    if (strcmp(argv[1], "writer") == 0) {
+        if (argc != 6) {
+            usage(argv[0]);
+            return 1;
+        }
+        long rows = atol(argv[3]);
+        size_t field_len = (size_t)strtoull(argv[4], NULL, 10);
+        size_t quote_period = (size_t)strtoull(argv[5], NULL, 10);
+        return bench_writer(argv[2], rows, field_len, quote_period);
     }
 
     usage(argv[0]);

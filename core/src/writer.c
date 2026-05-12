@@ -187,8 +187,74 @@ static int write_quoted_field_simd(cisv_writer *writer, const char *data, size_t
 }
 #endif
 
-// PERF: Fallback buffer size for unbuffered writes (4KB for cache efficiency)
-#define FALLBACK_BUFFER_SIZE 4096
+static inline int writer_fwrite_all(cisv_writer *writer, const void *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    if (fwrite(data, 1, len, writer->output) != len) {
+        return -1;
+    }
+    writer->bytes_written += len;
+    return 0;
+}
+
+static int write_quoted_field_direct(cisv_writer *writer, const char *data, size_t len) {
+    const char quote = writer->quote_char;
+    const char doubled_quote[2] = { quote, quote };
+
+    if (writer_fwrite_all(writer, &quote, 1) != 0) {
+        return -1;
+    }
+
+    const char *segment = data;
+    const char *end = data + len;
+    while (segment < end) {
+        const char *quote_pos = memchr(segment, quote, (size_t)(end - segment));
+        if (!quote_pos) {
+            if (writer_fwrite_all(writer, segment, (size_t)(end - segment)) != 0) {
+                return -1;
+            }
+            break;
+        }
+
+        if (writer_fwrite_all(writer, segment, (size_t)(quote_pos - segment)) != 0 ||
+            writer_fwrite_all(writer, doubled_quote, sizeof(doubled_quote)) != 0) {
+            return -1;
+        }
+        segment = quote_pos + 1;
+    }
+
+    return writer_fwrite_all(writer, &quote, 1);
+}
+
+static void write_quoted_field_buffered(cisv_writer *writer, const char *data, size_t len) {
+    const char quote = writer->quote_char;
+    uint8_t *out = writer->buffer + writer->buffer_pos;
+
+    *out++ = (uint8_t)quote;
+
+    const char *segment = data;
+    const char *end = data + len;
+    while (segment < end) {
+        const char *quote_pos = memchr(segment, quote, (size_t)(end - segment));
+        if (!quote_pos) {
+            size_t segment_len = (size_t)(end - segment);
+            memcpy(out, segment, segment_len);
+            out += segment_len;
+            break;
+        }
+
+        size_t segment_len = (size_t)(quote_pos - segment);
+        memcpy(out, segment, segment_len);
+        out += segment_len;
+        *out++ = (uint8_t)quote;
+        *out++ = (uint8_t)quote;
+        segment = quote_pos + 1;
+    }
+
+    *out++ = (uint8_t)quote;
+    writer->buffer_pos = (size_t)(out - writer->buffer);
+}
 
 static int write_quoted_field(cisv_writer *writer, const char *data, size_t len) {
     // Check for overflow: max_size = len * 2 + 2
@@ -199,57 +265,12 @@ static int write_quoted_field(cisv_writer *writer, const char *data, size_t len)
 
     int space_result = ensure_buffer_space(writer, max_size);
     if (space_result == -2) {
-        // PERF: Use local buffer instead of fputc() loop (50-100x faster)
-        // The fputc() function has significant per-call overhead
-        char fallback_buf[FALLBACK_BUFFER_SIZE];
-        size_t fb_pos = 0;
-
-        // Opening quote
-        fallback_buf[fb_pos++] = writer->quote_char;
-
-        for (size_t i = 0; i < len; i++) {
-            // Flush buffer when nearly full (need room for 2 chars + quote)
-            if (fb_pos >= FALLBACK_BUFFER_SIZE - 3) {
-                if (fwrite(fallback_buf, 1, fb_pos, writer->output) != fb_pos) {
-                    return -1;
-                }
-                writer->bytes_written += fb_pos;
-                fb_pos = 0;
-            }
-
-            // Escape quote characters by doubling them
-            if (data[i] == writer->quote_char) {
-                fallback_buf[fb_pos++] = writer->quote_char;
-            }
-            fallback_buf[fb_pos++] = data[i];
-        }
-
-        // Closing quote
-        fallback_buf[fb_pos++] = writer->quote_char;
-
-        // Flush remaining buffer
-        if (fb_pos > 0) {
-            if (fwrite(fallback_buf, 1, fb_pos, writer->output) != fb_pos) {
-                return -1;
-            }
-            writer->bytes_written += fb_pos;
-        }
-
-        return 0;
+        return write_quoted_field_direct(writer, data, len);
     } else if (space_result < 0) {
         return -1;
     }
 
-    writer->buffer[writer->buffer_pos++] = writer->quote_char;
-
-    for (size_t i = 0; i < len; i++) {
-        if (data[i] == writer->quote_char) {
-            writer->buffer[writer->buffer_pos++] = writer->quote_char;
-        }
-        writer->buffer[writer->buffer_pos++] = data[i];
-    }
-
-    writer->buffer[writer->buffer_pos++] = writer->quote_char;
+    write_quoted_field_buffered(writer, data, len);
     return 0;
 }
 

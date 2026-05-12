@@ -916,6 +916,98 @@ void test_writer_long_quoted_field_with_quotes(void) {
     }
 }
 
+void test_writer_large_quoted_field_direct_fallback(void) {
+    TEST("writer large quoted field direct fallback");
+
+    FILE *tmp = tmpfile();
+    if (!tmp) {
+        FAIL("failed to create temp file");
+        return;
+    }
+
+    cisv_writer_config config = {
+        .delimiter = ',',
+        .quote_char = '"',
+        .always_quote = 0,
+        .use_crlf = 0,
+        .null_string = "",
+        .buffer_size = 1024
+    };
+    cisv_writer *writer = cisv_writer_create_config(tmp, &config);
+    if (!writer) {
+        fclose(tmp);
+        FAIL("failed to create writer");
+        return;
+    }
+
+    const size_t field_len = 70000;
+    char *field = malloc(field_len);
+    if (!field) {
+        cisv_writer_destroy(writer);
+        fclose(tmp);
+        FAIL("failed to allocate test field");
+        return;
+    }
+    memset(field, 'a', field_len);
+    field[3] = ',';
+    field[1024] = '"';
+    field[33333] = '"';
+    field[field_len - 2] = '"';
+
+    size_t expected_len = field_len + 2 + 3 + 1;
+    char *expected = malloc(expected_len + 1);
+    if (!expected) {
+        free(field);
+        cisv_writer_destroy(writer);
+        fclose(tmp);
+        FAIL("failed to allocate expected field");
+        return;
+    }
+    size_t pos = 0;
+    expected[pos++] = '"';
+    for (size_t i = 0; i < field_len; i++) {
+        if (field[i] == '"') expected[pos++] = '"';
+        expected[pos++] = field[i];
+    }
+    expected[pos++] = '"';
+    expected[pos++] = '\n';
+    expected[pos] = '\0';
+
+    int rc = cisv_writer_field(writer, field, field_len);
+    if (rc == 0) rc = cisv_writer_row_end(writer);
+    if (rc == 0) rc = cisv_writer_flush(writer);
+    size_t bytes_written = cisv_writer_bytes_written(writer);
+
+    char *buf = malloc(expected_len + 1);
+    if (!buf) {
+        free(expected);
+        free(field);
+        cisv_writer_destroy(writer);
+        fclose(tmp);
+        FAIL("failed to allocate output buffer");
+        return;
+    }
+
+    fseek(tmp, 0, SEEK_SET);
+    size_t len = fread(buf, 1, expected_len, tmp);
+    buf[len] = '\0';
+
+    cisv_writer_destroy(writer);
+    fclose(tmp);
+
+    int ok = (rc == 0 && len == expected_len && bytes_written == expected_len &&
+              memcmp(buf, expected, expected_len) == 0);
+    free(buf);
+    free(expected);
+    free(field);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("large quoted writer fallback output mismatch");
+    }
+}
+
 void test_writer_config_validation(void) {
     TEST("writer config validation");
 
@@ -2161,6 +2253,7 @@ int main(void) {
     test_writer_basic();
     test_writer_quoting();
     test_writer_long_quoted_field_with_quotes();
+    test_writer_large_quoted_field_direct_fallback();
     test_writer_config_validation();
 
     // Multiline tests (issue #108)
