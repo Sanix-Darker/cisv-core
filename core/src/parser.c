@@ -1921,6 +1921,58 @@ static inline bool ends_with_row_terminator(const uint8_t *data, size_t size) {
     return size > 0 && (data[size - 1] == '\n' || data[size - 1] == '\r');
 }
 
+static bool contains_byte_fast(const uint8_t *data, size_t size, uint8_t needle) {
+    size_t i = 0;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i needle_v = _mm512_set1_epi8((char)needle);
+    while (i + 64 <= size) {
+        __m512i chunk = _mm512_loadu_si512((const void *)(data + i));
+        if (_mm512_cmpeq_epi8_mask(chunk, needle_v) != 0) {
+            return true;
+        }
+        i += 64;
+    }
+#elif defined(__AVX2__)
+    const __m256i needle_v = _mm256_set1_epi8((char)needle);
+    while (i + 32 <= size) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)(data + i));
+        if (_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, needle_v)) != 0) {
+            return true;
+        }
+        i += 32;
+    }
+#elif defined(__SSE2__)
+    const __m128i needle_v = _mm_set1_epi8((char)needle);
+    while (i + 16 <= size) {
+        __m128i chunk = _mm_loadu_si128((const __m128i *)(data + i));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, needle_v)) != 0) {
+            return true;
+        }
+        i += 16;
+    }
+#endif
+
+    while (i + 16 <= size) {
+        uint64_t word0;
+        uint64_t word1;
+        memcpy(&word0, data + i, sizeof(word0));
+        memcpy(&word1, data + i + 8, sizeof(word1));
+        if (swar_has_byte(word0, needle) | swar_has_byte(word1, needle)) {
+            return true;
+        }
+        i += 16;
+    }
+
+    for (; i < size; i++) {
+        if (data[i] == needle) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quote_char, bool *needs_fallback) {
     size_t nl_count = 0;
     size_t cr_count = 0;
@@ -2642,15 +2694,108 @@ static size_t count_chunk_rows_quote_aware(const uint8_t *start,
     return rows;
 }
 
+static const uint8_t *find_simple_row_end(const uint8_t *scan, const uint8_t *end) {
+    while (scan < end) {
+        size_t len = (size_t)(end - scan);
+        const uint8_t *nl = memchr(scan, '\n', len);
+        const uint8_t *cr = memchr(scan, '\r', len);
+        const uint8_t *row = NULL;
+
+        if (nl && cr) {
+            row = nl < cr ? nl : cr;
+        } else {
+            row = nl ? nl : cr;
+        }
+
+        if (!row) {
+            return end;
+        }
+        if (*row == '\r' && row + 1 < end && *(row + 1) == '\n') {
+            return row + 2;
+        }
+        return row + 1;
+    }
+
+    return end;
+}
+
+static cisv_chunk_t *split_chunks_simple_rows(
+    const cisv_mmap_file_t *file,
+    int num_chunks,
+    int *chunk_count
+) {
+    if (!file || !file->data || num_chunks <= 0 || !chunk_count) {
+        return NULL;
+    }
+
+    if (num_chunks > 256) num_chunks = 256;
+
+    size_t chunk_size = file->size / num_chunks;
+    if (chunk_size < 4096) {
+        num_chunks = 1;
+        chunk_size = file->size;
+    }
+
+    cisv_chunk_t *chunks = calloc(num_chunks, sizeof(cisv_chunk_t));
+    if (!chunks) return NULL;
+
+    const uint8_t *data = file->data;
+    const uint8_t *end = file->data + file->size;
+    const uint8_t *chunk_start = data;
+    int actual_chunks = 0;
+    size_t next_target = chunk_size;
+
+    while (actual_chunks < num_chunks - 1 && chunk_start < end) {
+        const uint8_t *target = data + next_target;
+        if (target <= chunk_start) {
+            target = chunk_start;
+        }
+        if (target >= end) {
+            break;
+        }
+
+        const uint8_t *target_end = find_simple_row_end(target, end);
+        if (target_end >= end) {
+            break;
+        }
+
+        chunks[actual_chunks].start = chunk_start;
+        chunks[actual_chunks].end = target_end;
+        chunks[actual_chunks].row_count = 0;
+        chunks[actual_chunks].chunk_index = actual_chunks;
+
+        chunk_start = target_end;
+        actual_chunks++;
+        next_target += chunk_size;
+    }
+
+    if (chunk_start < end && actual_chunks < num_chunks) {
+        chunks[actual_chunks].start = chunk_start;
+        chunks[actual_chunks].end = end;
+        chunks[actual_chunks].row_count = 0;
+        chunks[actual_chunks].chunk_index = actual_chunks;
+        actual_chunks++;
+    }
+
+    *chunk_count = actual_chunks;
+    return chunks;
+}
+
 static cisv_chunk_t *split_chunks_with_quote(
     const cisv_mmap_file_t *file,
     int num_chunks,
     int *chunk_count,
     char quote_char,
-    char escape_char
+    char escape_char,
+    bool fill_row_counts
 ) {
     if (!file || !file->data || num_chunks <= 0 || !chunk_count) {
         return NULL;
+    }
+
+    if (!fill_row_counts &&
+        !contains_byte_fast(file->data, file->size, (uint8_t)quote_char)) {
+        return split_chunks_simple_rows(file, num_chunks, chunk_count);
     }
 
     // Clamp to reasonable chunk count
@@ -2695,8 +2840,10 @@ static cisv_chunk_t *split_chunks_with_quote(
             }
             if ((size_t)(row_end - data) >= next_target) {
                 const uint8_t *target_end = row_end;
-                size_t row_count = count_chunk_rows_quote_aware(chunk_start, target_end,
-                                                                quote_char, escape_char);
+                size_t row_count = fill_row_counts
+                    ? count_chunk_rows_quote_aware(chunk_start, target_end,
+                                                   quote_char, escape_char)
+                    : 0;
 
                 chunks[actual_chunks].start = chunk_start;
                 chunks[actual_chunks].end = target_end;
@@ -2719,8 +2866,10 @@ static cisv_chunk_t *split_chunks_with_quote(
 
         // Count rows in this chunk using quote-aware scalar loop.
         // chunk_start is always at a row boundary, so initial state is outside quotes.
-        size_t row_count = count_chunk_rows_quote_aware(chunk_start, target_end,
-                                                        quote_char, escape_char);
+        size_t row_count = fill_row_counts
+            ? count_chunk_rows_quote_aware(chunk_start, target_end,
+                                           quote_char, escape_char)
+            : 0;
 
         chunks[actual_chunks].start = chunk_start;
         chunks[actual_chunks].end = target_end;
@@ -2740,7 +2889,7 @@ cisv_chunk_t *cisv_split_chunks(
     int num_chunks,
     int *chunk_count
 ) {
-    return split_chunks_with_quote(file, num_chunks, chunk_count, '"', '\0');
+    return split_chunks_with_quote(file, num_chunks, chunk_count, '"', '\0', true);
 }
 
 int cisv_parse_chunk(cisv_parser *p, const cisv_chunk_t *chunk) {
@@ -3317,7 +3466,7 @@ cisv_result_t **cisv_parse_file_parallel(const char *path, const cisv_config *co
         escape_char = config->escape;
     }
     cisv_chunk_t *chunks = split_chunks_with_quote(mmap_file, num_threads, &chunk_count,
-                                                   quote_char, escape_char);
+                                                   quote_char, escape_char, false);
     if (!chunks || chunk_count == 0) {
         cisv_mmap_close(mmap_file);
         return NULL;
