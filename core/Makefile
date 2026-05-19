@@ -115,7 +115,7 @@ else
 endif
 
 # Targets
-.PHONY: all static shared clean test test-native test-debug valgrind safety install bench-core
+.PHONY: all static shared clean test test-native test-debug valgrind safety install bench bench-core
 
 all: static shared
 
@@ -160,6 +160,8 @@ $(TEST_BIN): $(TEST_SRCS) $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $(TEST_SRCS) $(STATIC_LIB) -lm -lpthread
 
 bench-core: $(BENCH_BIN)
+
+bench: bench-core
 
 $(BENCH_BIN): $(BENCH_SRC) $(STATIC_LIB)
 	$(CC) $(CFLAGS) -I$(INC_DIR) -o $@ $(BENCH_SRC) $(STATIC_LIB) -lm -lpthread

@@ -2123,6 +2123,112 @@ static size_t count_newlines_fast(const uint8_t *data, size_t size, uint8_t quot
     return cr_count + nl_count - crlf_count + !ends_with_row_terminator(data, size);
 }
 
+static inline const uint8_t *count_find_next_special(const uint8_t *p, const uint8_t *end,
+                                                     uint8_t delimiter, uint8_t quote_char) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const __m512i delim_v = _mm512_set1_epi8((char)delimiter);
+    const __m512i quote_v = _mm512_set1_epi8((char)quote_char);
+    const __m512i nl_v = _mm512_set1_epi8('\n');
+    const __m512i cr_v = _mm512_set1_epi8('\r');
+
+    while (p + 64 <= end) {
+        __m512i chunk = _mm512_loadu_si512((const void *)p);
+        uint64_t mask =
+            (uint64_t)_mm512_cmpeq_epi8_mask(chunk, delim_v) |
+            (uint64_t)_mm512_cmpeq_epi8_mask(chunk, quote_v) |
+            (uint64_t)_mm512_cmpeq_epi8_mask(chunk, nl_v) |
+            (uint64_t)_mm512_cmpeq_epi8_mask(chunk, cr_v);
+        if (mask) {
+            return p + __builtin_ctzll(mask);
+        }
+        p += 64;
+    }
+#elif defined(__AVX2__)
+    const __m256i delim_v = _mm256_set1_epi8((char)delimiter);
+    const __m256i quote_v = _mm256_set1_epi8((char)quote_char);
+    const __m256i nl_v = _mm256_set1_epi8('\n');
+    const __m256i cr_v = _mm256_set1_epi8('\r');
+
+    while (p + 32 <= end) {
+        __m256i chunk = _mm256_loadu_si256((const __m256i *)p);
+        __m256i delim_cmp = _mm256_cmpeq_epi8(chunk, delim_v);
+        __m256i quote_cmp = _mm256_cmpeq_epi8(chunk, quote_v);
+        __m256i nl_cmp = _mm256_cmpeq_epi8(chunk, nl_v);
+        __m256i cr_cmp = _mm256_cmpeq_epi8(chunk, cr_v);
+        __m256i special = _mm256_or_si256(
+            _mm256_or_si256(delim_cmp, quote_cmp),
+            _mm256_or_si256(nl_cmp, cr_cmp));
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(special);
+        if (mask) {
+            return p + __builtin_ctz(mask);
+        }
+        p += 32;
+    }
+#elif defined(__SSE2__)
+    const __m128i delim_v = _mm_set1_epi8((char)delimiter);
+    const __m128i quote_v = _mm_set1_epi8((char)quote_char);
+    const __m128i nl_v = _mm_set1_epi8('\n');
+    const __m128i cr_v = _mm_set1_epi8('\r');
+
+    while (p + 16 <= end) {
+        __m128i chunk = _mm_loadu_si128((const __m128i *)p);
+        __m128i delim_cmp = _mm_cmpeq_epi8(chunk, delim_v);
+        __m128i quote_cmp = _mm_cmpeq_epi8(chunk, quote_v);
+        __m128i nl_cmp = _mm_cmpeq_epi8(chunk, nl_v);
+        __m128i cr_cmp = _mm_cmpeq_epi8(chunk, cr_v);
+        __m128i special = _mm_or_si128(
+            _mm_or_si128(delim_cmp, quote_cmp),
+            _mm_or_si128(nl_cmp, cr_cmp));
+        uint32_t mask = (uint32_t)_mm_movemask_epi8(special);
+        if (mask) {
+            return p + __builtin_ctz(mask);
+        }
+        p += 16;
+    }
+#endif
+
+    while (p + 16 <= end) {
+        uint64_t word0;
+        uint64_t word1;
+        memcpy(&word0, p, sizeof(word0));
+        memcpy(&word1, p + 8, sizeof(word1));
+
+        uint64_t mask0 = swar_has_byte(word0, delimiter) |
+                         swar_has_byte(word0, quote_char) |
+                         swar_has_byte(word0, '\n') |
+                         swar_has_byte(word0, '\r');
+        if (mask0) {
+            return p + (__builtin_ctzll(mask0) >> 3);
+        }
+
+        uint64_t mask1 = swar_has_byte(word1, delimiter) |
+                         swar_has_byte(word1, quote_char) |
+                         swar_has_byte(word1, '\n') |
+                         swar_has_byte(word1, '\r');
+        if (mask1) {
+            return p + 8 + (__builtin_ctzll(mask1) >> 3);
+        }
+
+        p += 16;
+    }
+
+    while (p < end) {
+        uint8_t c = *p;
+        if (c == delimiter || c == quote_char || c == '\n' || c == '\r') {
+            return p;
+        }
+        p++;
+    }
+
+    return end;
+}
+
+static inline const uint8_t *count_min_ptr(const uint8_t *a, const uint8_t *b) {
+    if (!a) return b;
+    if (!b) return a;
+    return a < b ? a : b;
+}
+
 static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                                      uint8_t delimiter, uint8_t quote_char,
                                      uint8_t escape_char, bool relaxed, bool *ok) {
@@ -2130,31 +2236,50 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
     bool in_quote = false;
     bool at_field_start = true;
     bool after_quote = false;
+    const uint8_t *p = data;
+    const uint8_t *end = data + size;
 
     *ok = true;
 
-    for (size_t i = 0; i < size; i++) {
-        uint8_t c = data[i];
-
+    while (p < end) {
         if (in_quote) {
-            if (escape_char != '\0' && c == escape_char) {
-                if (i + 1 >= size) {
+            while (p < end) {
+                const uint8_t *quote_pos = memchr(p, quote_char, (size_t)(end - p));
+                const uint8_t *escape_pos = escape_char != '\0'
+                    ? memchr(p, escape_char, (size_t)(end - p))
+                    : NULL;
+                const uint8_t *special = count_min_ptr(quote_pos, escape_pos);
+
+                if (!special) {
                     *ok = false;
                     return 0;
                 }
-                i++;
-            } else if (c == quote_char) {
-                if (i + 1 < size && data[i + 1] == quote_char) {
-                    i++;
-                } else {
-                    in_quote = false;
-                    after_quote = true;
+
+                if (escape_pos && special == escape_pos) {
+                    if (special + 1 >= end) {
+                        *ok = false;
+                        return 0;
+                    }
+                    p = special + 2;
+                    continue;
                 }
+
+                if (special + 1 < end && *(special + 1) == quote_char) {
+                    p = special + 2;
+                    continue;
+                }
+
+                in_quote = false;
+                after_quote = true;
+                p = special + 1;
+                break;
             }
             continue;
         }
 
         if (after_quote) {
+            uint8_t c = *p++;
+
             if (c == ' ' || c == '\t') {
                 continue;
             }
@@ -2171,8 +2296,8 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
             }
             if (c == '\r') {
                 rows++;
-                if (i + 1 < size && data[i + 1] == '\n') {
-                    i++;
+                if (p < end && *p == '\n') {
+                    p++;
                 }
                 after_quote = false;
                 at_field_start = true;
@@ -2188,6 +2313,17 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
             continue;
         }
 
+        const uint8_t *special = count_find_next_special(p, end, delimiter, quote_char);
+        if (special > p) {
+            at_field_start = false;
+        }
+        if (special >= end) {
+            break;
+        }
+
+        uint8_t c = *special;
+        p = special + 1;
+
         if (c == delimiter) {
             at_field_start = true;
         } else if (c == '\n') {
@@ -2195,8 +2331,8 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
             at_field_start = true;
         } else if (c == '\r') {
             rows++;
-            if (i + 1 < size && data[i + 1] == '\n') {
-                i++;
+            if (p < end && *p == '\n') {
+                p++;
             }
             at_field_start = true;
         } else if (c == quote_char) {
@@ -2207,8 +2343,6 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                 *ok = false;
                 return 0;
             }
-        } else {
-            at_field_start = false;
         }
     }
 
@@ -3212,6 +3346,72 @@ static cisv_result_t *batch_result_create(void) {
     return batch_result_create_with_hint(0);
 }
 
+static cisv_result_t *batch_result_create_exact(size_t row_cap,
+                                                size_t field_cap,
+                                                size_t data_cap) {
+    cisv_result_t *r = calloc(1, sizeof(cisv_result_t));
+    if (!r) return NULL;
+
+    size_t rows_bytes = 0;
+    size_t fields_bytes = 0;
+    size_t lengths_bytes = 0;
+    if ((row_cap > 0 && __builtin_mul_overflow(row_cap, sizeof(cisv_row_t), &rows_bytes)) ||
+        (field_cap > 0 && __builtin_mul_overflow(field_cap, sizeof(char *), &fields_bytes)) ||
+        (field_cap > 0 && __builtin_mul_overflow(field_cap, sizeof(size_t), &lengths_bytes))) {
+        free(r);
+        return NULL;
+    }
+
+    size_t metadata_bytes;
+    size_t total_bytes;
+    if (__builtin_add_overflow(rows_bytes, fields_bytes, &metadata_bytes) ||
+        __builtin_add_overflow(metadata_bytes, lengths_bytes, &metadata_bytes) ||
+        __builtin_add_overflow(metadata_bytes, data_cap, &total_bytes)) {
+        free(r);
+        return NULL;
+    }
+
+    size_t memory_budget = cisv_runtime_memory_budget();
+    if (memory_budget > 0 && total_bytes > memory_budget) {
+        free(r);
+        return NULL;
+    }
+
+    if (row_cap > 0) {
+        r->rows = malloc(rows_bytes);
+        if (!r->rows) {
+            free(r);
+            return NULL;
+        }
+    }
+    if (field_cap > 0) {
+        r->all_fields = malloc(fields_bytes);
+        r->all_lengths = malloc(lengths_bytes);
+        if (!r->all_fields || !r->all_lengths) {
+            free(r->rows);
+            free(r->all_fields);
+            free(r->all_lengths);
+            free(r);
+            return NULL;
+        }
+    }
+    if (data_cap > 0) {
+        r->field_data = malloc(data_cap);
+        if (!r->field_data) {
+            free(r->rows);
+            free(r->all_fields);
+            free(r->all_lengths);
+            free(r);
+            return NULL;
+        }
+    }
+
+    r->row_capacity = row_cap;
+    r->fields_capacity = field_cap;
+    r->field_data_capacity = data_cap;
+    return r;
+}
+
 static cisv_result_t *batch_result_create_error(int code, const char *message) {
     cisv_result_t *r = calloc(1, sizeof(cisv_result_t));
     if (!r) return NULL;
@@ -3232,10 +3432,235 @@ void cisv_result_free(cisv_result_t *result) {
     free(result);
 }
 
+static bool batch_simple_lf_config_allowed(const cisv_config *config) {
+    cisv_config effective;
+    if (config) {
+        effective = *config;
+    } else {
+        cisv_config_init(&effective);
+    }
+
+    return cisv_config_is_valid(&effective) &&
+           effective.escape == '\0' &&
+           effective.comment == '\0' &&
+           !effective.trim &&
+           !effective.skip_empty_lines &&
+           !effective.relaxed &&
+           !effective.skip_lines_with_error &&
+           effective.max_row_size == 0 &&
+           cisv_runtime_max_row_size() == 0 &&
+           cisv_runtime_memory_budget() == 0 &&
+           effective.from_line <= 1 &&
+           effective.to_line == 0;
+}
+
+static bool batch_simple_lf_shape(const uint8_t *data,
+                                  size_t size,
+                                  uint8_t delimiter,
+                                  uint8_t quote_char,
+                                  size_t *out_rows,
+                                  size_t *out_fields,
+                                  size_t *out_data_size) {
+    size_t rows = 0;
+    size_t delimiters = 0;
+    const uint8_t *p = data;
+    const uint8_t *end = data + size;
+
+    while (p < end) {
+        const uint8_t *special = count_find_next_special(p, end, delimiter, quote_char);
+        if (special >= end) {
+            break;
+        }
+
+        uint8_t c = *special;
+        if (c == quote_char || c == '\r') {
+            return false;
+        }
+        if (c == delimiter) {
+            delimiters++;
+        } else if (c == '\n') {
+            rows++;
+        }
+        p = special + 1;
+    }
+
+    if (size > 0 && data[size - 1] != '\n') {
+        rows++;
+    }
+
+    size_t fields;
+    if (__builtin_add_overflow(delimiters, rows, &fields)) {
+        return false;
+    }
+
+    size_t data_size = size;
+    if (size > 0 && data[size - 1] != '\n') {
+        if (__builtin_add_overflow(data_size, 1, &data_size)) {
+            return false;
+        }
+    }
+
+    *out_rows = rows;
+    *out_fields = fields;
+    *out_data_size = data_size;
+    return true;
+}
+
+static cisv_result_t *batch_parse_simple_lf_buffer(const uint8_t *data,
+                                                   size_t size,
+                                                   uint8_t delimiter,
+                                                   uint8_t quote_char) {
+    if (size == 0) {
+        return batch_result_create_exact(0, 0, 0);
+    }
+
+    size_t row_count = 0;
+    size_t field_count = 0;
+    size_t data_size = 0;
+    if (!batch_simple_lf_shape(data, size, delimiter, quote_char,
+                               &row_count, &field_count, &data_size)) {
+        return NULL;
+    }
+
+    cisv_result_t *result = batch_result_create_exact(row_count, field_count, data_size);
+    if (!result) {
+        return NULL;
+    }
+
+    memcpy(result->field_data, data, size);
+    if (data_size > size) {
+        result->field_data[size] = '\0';
+    }
+
+    size_t row_idx = 0;
+    size_t field_idx = 0;
+    size_t row_field_start = 0;
+    size_t field_start = 0;
+
+    for (size_t i = 0; i < size; i++) {
+        uint8_t c = data[i];
+        if (c != delimiter && c != '\n') {
+            continue;
+        }
+
+        result->field_data[i] = '\0';
+        result->all_fields[field_idx] = result->field_data + field_start;
+        result->all_lengths[field_idx] = i - field_start;
+        field_idx++;
+
+        if (c == '\n') {
+            cisv_row_t *row = &result->rows[row_idx];
+            row->fields = &result->all_fields[row_field_start];
+            row->field_lengths = &result->all_lengths[row_field_start];
+            row->field_count = field_idx - row_field_start;
+            row_idx++;
+            row_field_start = field_idx;
+        }
+
+        field_start = i + 1;
+    }
+
+    if (data[size - 1] != '\n') {
+        result->all_fields[field_idx] = result->field_data + field_start;
+        result->all_lengths[field_idx] = size - field_start;
+        field_idx++;
+
+        cisv_row_t *row = &result->rows[row_idx];
+        row->fields = &result->all_fields[row_field_start];
+        row->field_lengths = &result->all_lengths[row_field_start];
+        row->field_count = field_idx - row_field_start;
+        row_idx++;
+    }
+
+    result->row_count = row_idx;
+    result->total_fields = field_idx;
+    result->field_data_size = data_size;
+    return result;
+}
+
+static cisv_result_t *try_parse_file_batch_simple_lf(const char *path,
+                                                     const cisv_config *config) {
+    if (!batch_simple_lf_config_allowed(config)) {
+        return NULL;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return NULL;
+    }
+
+    if (st.st_size == 0) {
+        close(fd);
+        return batch_result_create_exact(0, 0, 0);
+    }
+
+    int flags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+    flags |= MAP_POPULATE;
+#endif
+
+    uint8_t *base = (uint8_t *)mmap(NULL, st.st_size, PROT_READ, flags, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+
+    madvise(base, st.st_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+    cisv_config effective;
+    if (config) {
+        effective = *config;
+    } else {
+        cisv_config_init(&effective);
+    }
+
+    cisv_result_t *result = batch_parse_simple_lf_buffer(
+        base,
+        (size_t)st.st_size,
+        (uint8_t)effective.delimiter,
+        (uint8_t)effective.quote);
+
+    munmap(base, st.st_size);
+    close(fd);
+    return result;
+}
+
+static cisv_result_t *try_parse_string_batch_simple_lf(const char *data,
+                                                       size_t len,
+                                                       const cisv_config *config) {
+    if (!batch_simple_lf_config_allowed(config)) {
+        return NULL;
+    }
+
+    cisv_config effective;
+    if (config) {
+        effective = *config;
+    } else {
+        cisv_config_init(&effective);
+    }
+
+    return batch_parse_simple_lf_buffer(
+        (const uint8_t *)data,
+        len,
+        (uint8_t)effective.delimiter,
+        (uint8_t)effective.quote);
+}
+
 cisv_result_t *cisv_parse_file_batch(const char *path, const cisv_config *config) {
     if (!path) {
         errno = EINVAL;
         return NULL;
+    }
+
+    cisv_result_t *simple_result = try_parse_file_batch_simple_lf(path, config);
+    if (simple_result) {
+        return simple_result;
     }
 
     // Get file size for buffer pre-sizing (reduces reallocations)
@@ -3295,6 +3720,11 @@ cisv_result_t *cisv_parse_string_batch(const char *data, size_t len, const cisv_
     if (!data) {
         errno = EINVAL;
         return NULL;
+    }
+
+    cisv_result_t *simple_result = try_parse_string_batch_simple_lf(data, len, config);
+    if (simple_result) {
+        return simple_result;
     }
 
     cisv_result_t *result = batch_result_create();

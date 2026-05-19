@@ -2311,6 +2311,49 @@ void test_trailing_empty_field_at_eof(void) {
     }
 }
 
+static int batch_simple_lf_edges_ok(const cisv_result_t *result) {
+    return result &&
+           result->error_code == 0 &&
+           result->row_count == 4 &&
+           result->total_fields == 9 &&
+           result->rows[0].field_count == 3 &&
+           strcmp(result->rows[0].fields[0], "a") == 0 &&
+           strcmp(result->rows[0].fields[1], "") == 0 &&
+           strcmp(result->rows[0].fields[2], "c") == 0 &&
+           result->rows[1].field_count == 1 &&
+           strcmp(result->rows[1].fields[0], "") == 0 &&
+           result->rows[2].field_count == 3 &&
+           strcmp(result->rows[2].fields[0], "1") == 0 &&
+           strcmp(result->rows[2].fields[1], "2") == 0 &&
+           strcmp(result->rows[2].fields[2], "") == 0 &&
+           result->rows[3].field_count == 2 &&
+           strcmp(result->rows[3].fields[0], "last") == 0 &&
+           strcmp(result->rows[3].fields[1], "row") == 0;
+}
+
+void test_batch_simple_lf_materializer_edges(void) {
+    TEST("batch simple LF materializer preserves edge fields");
+
+    const char *csv = "a,,c\n\n1,2,\nlast,row";
+    cisv_result_t *string_result = cisv_parse_string_batch(csv, strlen(csv), NULL);
+
+    const char *path = write_temp_csv(csv);
+    cisv_result_t *file_result = path ? cisv_parse_file_batch(path, NULL) : NULL;
+
+    int ok = batch_simple_lf_edges_ok(string_result) &&
+             batch_simple_lf_edges_ok(file_result);
+
+    cisv_result_free(string_result);
+    cisv_result_free(file_result);
+    if (path) unlink(path);
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("simple LF batch materializer did not preserve empty fields/rows");
+    }
+}
+
 void test_quoted_field_closes_at_eof(void) {
     TEST("quoted field closes at EOF");
     reset_test_state();
@@ -2944,6 +2987,7 @@ int main(void) {
     test_skip_empty_preserves_empty_fields();
     test_batch_line_range_grouping();
     test_trailing_empty_field_at_eof();
+    test_batch_simple_lf_materializer_edges();
     test_quoted_field_closes_at_eof();
     test_malformed_quote_errors();
     test_parse_comment_lines();
