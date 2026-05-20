@@ -2989,7 +2989,7 @@ void test_rows_merge_dedup_exclude_first(void) {
         stats.excluded_rows == 2) {
         PASS();
     } else {
-        char msg[256];
+        char msg[1024];
         snprintf(msg, sizeof(msg),
                  "status=%d error=%s input=%zu output=%zu dup=%zu excl=%zu got=%s",
                  status, error, stats.input_rows, stats.output_rows,
@@ -3044,7 +3044,7 @@ void test_rows_dedup_keep_last_order(void) {
         stats.duplicate_rows == 1) {
         PASS();
     } else {
-        char msg[256];
+        char msg[1024];
         snprintf(msg, sizeof(msg), "status=%d error=%s got=%s", status, error, read_ok ? buf : "<read failed>");
         FAIL(msg);
     }
@@ -3095,7 +3095,7 @@ void test_rows_dedup_composite_keys_are_structured(void) {
         stats.duplicate_rows == 1) {
         PASS();
     } else {
-        char msg[256];
+        char msg[1024];
         snprintf(msg, sizeof(msg), "status=%d error=%s got=%s", status, error, read_ok ? buf : "<read failed>");
         FAIL(msg);
     }
@@ -3163,7 +3163,7 @@ void test_rows_external_merge_cleans_temp_files(void) {
         tmp_clean) {
         PASS();
     } else {
-        char msg[256];
+        char msg[1024];
         snprintf(msg, sizeof(msg),
                  "status=%d error=%s out=%zu dup=%zu excl=%zu tmp_clean=%d got=%s",
                  status, error, stats.output_rows, stats.duplicate_rows,
