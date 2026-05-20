@@ -102,7 +102,7 @@ TEST_DIR = tests
 BUILD_DIR = build
 
 # Source files
-SRCS = $(SRC_DIR)/parser.c $(SRC_DIR)/writer.c $(SRC_DIR)/transformer.c
+SRCS = $(SRC_DIR)/parser.c $(SRC_DIR)/writer.c $(SRC_DIR)/transformer.c $(SRC_DIR)/operations.c
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 OBJS_DEBUG = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.debug.o,$(SRCS))
 

@@ -8,6 +8,7 @@
 #include "cisv/parser.h"
 #include "cisv/writer.h"
 #include "cisv/transformer.h"
+#include "cisv/operations.h"
 
 static int test_count = 0;
 static int pass_count = 0;
@@ -82,6 +83,33 @@ static const char* write_temp_csv(const char *content) {
     fwrite(content, 1, strlen(content), f);
     fclose(f);
     return path;
+}
+
+static int write_temp_csv_named(const char *name, const char *content, char *path, size_t path_len) {
+    if (!name || !content || !path || path_len == 0) return -1;
+    if (snprintf(path, path_len, "/tmp/test_cisv_core_%d_%s.csv", getpid(), name) >= (int)path_len) {
+        return -1;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    size_t len = strlen(content);
+    int write_ok = fwrite(content, 1, len, f) == len;
+    int close_ok = fclose(f) == 0;
+    int ok = write_ok && close_ok;
+    if (!ok) {
+        unlink(path);
+        return -1;
+    }
+    return 0;
+}
+
+static int read_tmpfile_string(FILE *f, char *buf, size_t buf_len) {
+    if (!f || !buf || buf_len == 0) return -1;
+    if (fflush(f) != 0 || fseek(f, 0, SEEK_SET) != 0) return -1;
+    size_t n = fread(buf, 1, buf_len - 1, f);
+    if (ferror(f)) return -1;
+    buf[n] = '\0';
+    return 0;
 }
 
 static char *save_env_value(const char *name) {
@@ -2908,6 +2936,170 @@ void test_wide_multiline_json_stress(void) {
     cisv_result_free(batch);
 }
 
+void test_rows_merge_dedup_exclude_first(void) {
+    TEST("rows merge excludes deleted keys and keeps first row");
+
+    char newest[256], middle[256], oldest[256], deleted[256];
+    if (write_temp_csv_named("newest", "Id,Name\n2,new\n3,keep\n4,del\n", newest, sizeof(newest)) != 0 ||
+        write_temp_csv_named("middle", "Id,Name\n1,mid1\n2,dup\n4,del2\n", middle, sizeof(middle)) != 0 ||
+        write_temp_csv_named("oldest", "Id,Name\n1,dupold\n5,old\n", oldest, sizeof(oldest)) != 0 ||
+        write_temp_csv_named("deleted", "Id\n4\n", deleted, sizeof(deleted)) != 0) {
+        FAIL("failed to create temporary merge fixtures");
+        return;
+    }
+
+    FILE *out = tmpfile();
+    if (!out) {
+        unlink(newest); unlink(middle); unlink(oldest); unlink(deleted);
+        FAIL("tmpfile failed");
+        return;
+    }
+
+    const char *inputs[] = {newest, middle, oldest};
+    const char *keys[] = {"Id"};
+    cisv_rows_options_t options;
+    cisv_rows_options_init(&options);
+    options.mode = CISV_ROWS_MERGE;
+    options.input_files = inputs;
+    options.input_file_count = 3;
+    options.key_columns = keys;
+    options.key_column_count = 1;
+    options.exclude_file = deleted;
+    options.exclude_key_columns = keys;
+    options.exclude_key_column_count = 1;
+    options.output = out;
+
+    cisv_rows_stats_t stats;
+    char error[256] = {0};
+    cisv_rows_status_t status = cisv_rows_execute(&options, &stats, error, sizeof(error));
+
+    char buf[512];
+    int read_ok = read_tmpfile_string(out, buf, sizeof(buf)) == 0;
+    fclose(out);
+    unlink(newest); unlink(middle); unlink(oldest); unlink(deleted);
+
+    const char *expected = "Id,Name\n2,new\n3,keep\n1,mid1\n5,old\n";
+    if (status == CISV_ROWS_OK &&
+        read_ok &&
+        strcmp(buf, expected) == 0 &&
+        stats.input_rows == 8 &&
+        stats.output_rows == 4 &&
+        stats.duplicate_rows == 2 &&
+        stats.excluded_rows == 2) {
+        PASS();
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "status=%d error=%s input=%zu output=%zu dup=%zu excl=%zu got=%s",
+                 status, error, stats.input_rows, stats.output_rows,
+                 stats.duplicate_rows, stats.excluded_rows, read_ok ? buf : "<read failed>");
+        FAIL(msg);
+    }
+}
+
+void test_rows_dedup_keep_last_order(void) {
+    TEST("rows dedup keep last emits final occurrence order");
+
+    char input[256];
+    if (write_temp_csv_named("dedup_last", "Id,V\n1,a\n2,b\n1,c\n", input, sizeof(input)) != 0) {
+        FAIL("failed to create dedup fixture");
+        return;
+    }
+
+    FILE *out = tmpfile();
+    if (!out) {
+        unlink(input);
+        FAIL("tmpfile failed");
+        return;
+    }
+
+    const char *inputs[] = {input};
+    const char *keys[] = {"Id"};
+    cisv_rows_options_t options;
+    cisv_rows_options_init(&options);
+    options.mode = CISV_ROWS_DEDUP;
+    options.input_files = inputs;
+    options.input_file_count = 1;
+    options.key_columns = keys;
+    options.key_column_count = 1;
+    options.keep = CISV_KEEP_LAST;
+    options.output = out;
+
+    cisv_rows_stats_t stats;
+    char error[256] = {0};
+    cisv_rows_status_t status = cisv_rows_execute(&options, &stats, error, sizeof(error));
+
+    char buf[256];
+    int read_ok = read_tmpfile_string(out, buf, sizeof(buf)) == 0;
+    fclose(out);
+    unlink(input);
+
+    const char *expected = "Id,V\n2,b\n1,c\n";
+    if (status == CISV_ROWS_OK &&
+        read_ok &&
+        strcmp(buf, expected) == 0 &&
+        stats.input_rows == 3 &&
+        stats.output_rows == 2 &&
+        stats.duplicate_rows == 1) {
+        PASS();
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "status=%d error=%s got=%s", status, error, read_ok ? buf : "<read failed>");
+        FAIL(msg);
+    }
+}
+
+void test_rows_dedup_composite_keys_are_structured(void) {
+    TEST("rows dedup composite keys avoid ambiguous concatenation");
+
+    char input[256];
+    if (write_temp_csv_named("dedup_composite", "A,B,V\n1,23,x\n12,3,y\n1,23,z\n", input, sizeof(input)) != 0) {
+        FAIL("failed to create composite fixture");
+        return;
+    }
+
+    FILE *out = tmpfile();
+    if (!out) {
+        unlink(input);
+        FAIL("tmpfile failed");
+        return;
+    }
+
+    const char *inputs[] = {input};
+    const char *keys[] = {"A", "B"};
+    cisv_rows_options_t options;
+    cisv_rows_options_init(&options);
+    options.mode = CISV_ROWS_DEDUP;
+    options.input_files = inputs;
+    options.input_file_count = 1;
+    options.key_columns = keys;
+    options.key_column_count = 2;
+    options.output = out;
+
+    cisv_rows_stats_t stats;
+    char error[256] = {0};
+    cisv_rows_status_t status = cisv_rows_execute(&options, &stats, error, sizeof(error));
+
+    char buf[256];
+    int read_ok = read_tmpfile_string(out, buf, sizeof(buf)) == 0;
+    fclose(out);
+    unlink(input);
+
+    const char *expected = "A,B,V\n1,23,x\n12,3,y\n";
+    if (status == CISV_ROWS_OK &&
+        read_ok &&
+        strcmp(buf, expected) == 0 &&
+        stats.input_rows == 3 &&
+        stats.output_rows == 2 &&
+        stats.duplicate_rows == 1) {
+        PASS();
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "status=%d error=%s got=%s", status, error, read_ok ? buf : "<read failed>");
+        FAIL(msg);
+    }
+}
+
 int main(void) {
     printf("CISV Core Library Tests\n");
     printf("========================\n\n");
@@ -2998,6 +3190,12 @@ int main(void) {
     test_parallel_cr_only_chunk_split();
     test_parallel_malformed_quote_errors();
     test_wide_multiline_json_stress();
+
+    // Row operation tests
+    printf("\nRow Operation Tests:\n");
+    test_rows_merge_dedup_exclude_first();
+    test_rows_dedup_keep_last_order();
+    test_rows_dedup_composite_keys_are_structured();
 
     // Summary
     printf("\n========================\n");
