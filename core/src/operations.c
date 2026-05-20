@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
@@ -946,6 +947,733 @@ static cisv_rows_status_t flush_keep_last_rows(cisv_rows_runtime_t *rt) {
     return CISV_ROWS_OK;
 }
 
+static size_t estimate_source_rows(const cisv_rows_options_t *opt);
+
+typedef struct {
+    char path[PATH_MAX];
+    FILE *file;
+} cisv_temp_shard_t;
+
+static size_t rows_choose_external_shards(const cisv_rows_options_t *opt) {
+    size_t estimate = estimate_source_rows(opt);
+    size_t limit = opt->memory_limit ? opt->memory_limit : (64u * 1024u * 1024u);
+    size_t keys_per_shard = limit / 96u;
+    if (keys_per_shard < 1024u) keys_per_shard = 1024u;
+
+    size_t shards = (estimate + keys_per_shard - 1u) / keys_per_shard;
+    if (shards < 16u) shards = 16u;
+    if (shards > 1024u) shards = 1024u;
+    return rows_next_power_of_two(shards);
+}
+
+static const char *rows_tmp_dir(const cisv_rows_options_t *opt) {
+    if (opt && opt->tmp_dir && opt->tmp_dir[0]) return opt->tmp_dir;
+    const char *env = getenv("TMPDIR");
+    return (env && env[0]) ? env : "/tmp";
+}
+
+static int temp_shards_create(cisv_temp_shard_t **out,
+                              size_t count,
+                              const char *tmp_dir,
+                              const char *prefix,
+                              char *error,
+                              size_t error_len) {
+    cisv_temp_shard_t *shards = calloc(count, sizeof(cisv_temp_shard_t));
+    if (!shards) return -1;
+
+    for (size_t i = 0; i < count; i++) {
+        char tmpl[PATH_MAX];
+        int n = snprintf(tmpl, sizeof(tmpl), "%s/cisv-%s-%zu-XXXXXX", tmp_dir, prefix, i);
+        if (n < 0 || n >= (int)sizeof(tmpl)) {
+            rows_set_error(error, error_len, "temporary path is too long");
+            for (size_t j = 0; j < i; j++) {
+                if (shards[j].file) fclose(shards[j].file);
+                if (shards[j].path[0]) unlink(shards[j].path);
+            }
+            free(shards);
+            return -1;
+        }
+
+        int fd = mkstemp(tmpl);
+        if (fd < 0) {
+            rows_set_error(error, error_len, "failed to create temporary shard in %s", tmp_dir);
+            for (size_t j = 0; j < i; j++) {
+                if (shards[j].file) fclose(shards[j].file);
+                if (shards[j].path[0]) unlink(shards[j].path);
+            }
+            free(shards);
+            return -1;
+        }
+
+        FILE *f = fdopen(fd, "wb");
+        if (!f) {
+            close(fd);
+            unlink(tmpl);
+            rows_set_error(error, error_len, "failed to open temporary shard stream");
+            for (size_t j = 0; j < i; j++) {
+                if (shards[j].file) fclose(shards[j].file);
+                if (shards[j].path[0]) unlink(shards[j].path);
+            }
+            free(shards);
+            return -1;
+        }
+        memcpy(shards[i].path, tmpl, (size_t)n + 1u);
+        shards[i].file = f;
+    }
+
+    *out = shards;
+    return 0;
+}
+
+static void temp_shards_close(cisv_temp_shard_t *shards, size_t count) {
+    if (!shards) return;
+    for (size_t i = 0; i < count; i++) {
+        if (shards[i].file) {
+            fclose(shards[i].file);
+            shards[i].file = NULL;
+        }
+    }
+}
+
+static void temp_shards_destroy(cisv_temp_shard_t *shards, size_t count) {
+    if (!shards) return;
+    temp_shards_close(shards, count);
+    for (size_t i = 0; i < count; i++) {
+        if (shards[i].path[0]) unlink(shards[i].path);
+    }
+    free(shards);
+}
+
+static int write_external_key_record(FILE *f,
+                                     uint64_t seq,
+                                     const char *key,
+                                     size_t key_len,
+                                     int with_seq,
+                                     size_t *bytes_written) {
+    if (key_len > UINT32_MAX) return -1;
+    uint32_t len32 = (uint32_t)key_len;
+    size_t written = 0;
+    if (with_seq) {
+        if (fwrite(&seq, sizeof(seq), 1, f) != 1) return -1;
+        written += sizeof(seq);
+    }
+    if (fwrite(&len32, sizeof(len32), 1, f) != 1) return -1;
+    written += sizeof(len32);
+    if (key_len > 0 && fwrite(key, 1, key_len, f) != key_len) return -1;
+    written += key_len;
+    if (bytes_written) *bytes_written += written;
+    return 0;
+}
+
+static int read_external_key_record(FILE *f,
+                                    uint64_t *seq,
+                                    cisv_key_builder_t *builder,
+                                    int with_seq,
+                                    const char **key,
+                                    size_t *key_len,
+                                    size_t *bytes_read) {
+    uint64_t local_seq = 0;
+    uint32_t len32 = 0;
+    size_t nread = 0;
+
+    if (with_seq) {
+        size_t n = fread(&local_seq, sizeof(local_seq), 1, f);
+        if (n != 1) {
+            if (feof(f)) return 0;
+            return -1;
+        }
+        nread += sizeof(local_seq);
+    }
+
+    size_t n = fread(&len32, sizeof(len32), 1, f);
+    if (n != 1) {
+        if (!with_seq && feof(f)) return 0;
+        return -1;
+    }
+    nread += sizeof(len32);
+
+    builder->len = 0;
+    if (key_builder_reserve(builder, (size_t)len32) != 0) return -1;
+    if (len32 > 0 && fread(builder->data, 1, len32, f) != len32) return -1;
+    builder->len = (size_t)len32;
+    nread += (size_t)len32;
+
+    if (seq) *seq = local_seq;
+    *key = builder->data;
+    *key_len = builder->len;
+    if (bytes_read) *bytes_read += nread;
+    return 1;
+}
+
+static void bitset_set(unsigned char *bits, size_t index) {
+    bits[index >> 3] |= (unsigned char)(1u << (index & 7u));
+}
+
+static int bitset_get(const unsigned char *bits, size_t index) {
+    return (bits[index >> 3] & (unsigned char)(1u << (index & 7u))) != 0;
+}
+
+static cisv_rows_status_t external_partition_exclude(cisv_rows_runtime_t *rt,
+                                                     cisv_temp_shard_t *exclude_shards,
+                                                     size_t shard_count) {
+    const cisv_rows_options_t *opt = rt->options;
+    if (!opt->exclude_file) return CISV_ROWS_OK;
+
+    cisv_iterator_t *it = cisv_iterator_open(opt->exclude_file, &opt->csv_config);
+    if (!it) {
+        rows_set_error(rt->error, rt->error_len, "failed to open exclude keys file: %s", opt->exclude_file);
+        return CISV_ROWS_IO_ERROR;
+    }
+
+    const char **fields = NULL;
+    const size_t *lengths = NULL;
+    size_t field_count = 0;
+    size_t *exclude_indexes = NULL;
+    size_t exclude_index_count = 0;
+    cisv_key_builder_t builder = {0};
+    int rc;
+
+    if (!opt->no_header) {
+        rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+        if (rc == CISV_ITER_EOF) {
+            cisv_iterator_close(it);
+            rows_set_error(rt->error, rt->error_len, "exclude keys file is empty: %s", opt->exclude_file);
+            return CISV_ROWS_MISSING_KEY;
+        }
+        if (rc == CISV_ITER_ERROR) {
+            cisv_iterator_close(it);
+            rows_set_error(rt->error, rt->error_len, "parse error in exclude keys file: %s", opt->exclude_file);
+            return CISV_ROWS_PARSE_ERROR;
+        }
+        cisv_rows_status_t status = resolve_key_indexes(
+            opt->exclude_key_columns,
+            opt->exclude_key_column_count,
+            opt->exclude_key_indexes,
+            opt->exclude_key_index_count,
+            opt->use_exclude_key_indexes,
+            fields,
+            lengths,
+            field_count,
+            opt->no_header,
+            &exclude_indexes,
+            &exclude_index_count,
+            rt->error,
+            rt->error_len
+        );
+        if (status != CISV_ROWS_OK) {
+            cisv_iterator_close(it);
+            key_builder_destroy(&builder);
+            return status;
+        }
+    } else {
+        cisv_rows_status_t status = resolve_key_indexes(
+            opt->exclude_key_columns,
+            opt->exclude_key_column_count,
+            opt->exclude_key_indexes,
+            opt->exclude_key_index_count,
+            opt->use_exclude_key_indexes,
+            NULL,
+            NULL,
+            0,
+            opt->no_header,
+            &exclude_indexes,
+            &exclude_index_count,
+            rt->error,
+            rt->error_len
+        );
+        if (status != CISV_ROWS_OK) {
+            cisv_iterator_close(it);
+            key_builder_destroy(&builder);
+            return status;
+        }
+    }
+
+    while ((rc = cisv_iterator_next(it, &fields, &lengths, &field_count)) == CISV_ITER_OK) {
+        const char *key = NULL;
+        size_t key_len = 0;
+        int empty_key = 0;
+        int key_rc = build_row_key(fields, lengths, field_count, exclude_indexes,
+                                   exclude_index_count, &builder, &key, &key_len, &empty_key);
+        if (key_rc == -2) {
+            rt->stats->malformed_rows++;
+            if (opt->csv_config.skip_lines_with_error) continue;
+            free(exclude_indexes);
+            cisv_iterator_close(it);
+            key_builder_destroy(&builder);
+            rows_set_error(rt->error, rt->error_len, "missing exclude key field in %s", opt->exclude_file);
+            return CISV_ROWS_PARSE_ERROR;
+        }
+        if (key_rc != 0) {
+            free(exclude_indexes);
+            cisv_iterator_close(it);
+            key_builder_destroy(&builder);
+            return CISV_ROWS_IO_ERROR;
+        }
+        if (opt->drop_empty_key && empty_key) continue;
+
+        uint64_t hash = rows_hash_bytes(key, key_len);
+        size_t shard = (size_t)hash & (shard_count - 1u);
+        if (write_external_key_record(exclude_shards[shard].file, 0, key, key_len, 0,
+                                      &rt->stats->temp_bytes_written) != 0) {
+            free(exclude_indexes);
+            cisv_iterator_close(it);
+            key_builder_destroy(&builder);
+            rows_set_error(rt->error, rt->error_len, "failed writing exclude temporary shard");
+            return CISV_ROWS_EXTERNAL_ERROR;
+        }
+    }
+
+    free(exclude_indexes);
+    cisv_iterator_close(it);
+    key_builder_destroy(&builder);
+    if (rc == CISV_ITER_ERROR) {
+        rows_set_error(rt->error, rt->error_len, "parse error in exclude keys file: %s", opt->exclude_file);
+        return CISV_ROWS_PARSE_ERROR;
+    }
+    return CISV_ROWS_OK;
+}
+
+static cisv_rows_status_t external_partition_sources(cisv_rows_runtime_t *rt,
+                                                     cisv_temp_shard_t *candidate_shards,
+                                                     size_t shard_count) {
+    const cisv_rows_options_t *opt = rt->options;
+
+    for (size_t file_index = 0; file_index < opt->input_file_count; file_index++) {
+        const char *path = opt->input_files[file_index];
+        cisv_iterator_t *it = cisv_iterator_open(path, &opt->csv_config);
+        if (!it) {
+            rows_set_error(rt->error, rt->error_len, "failed to open input file: %s", path);
+            return CISV_ROWS_IO_ERROR;
+        }
+
+        const char **fields = NULL;
+        const size_t *lengths = NULL;
+        size_t field_count = 0;
+        cisv_key_builder_t builder = {0};
+        int rc;
+
+        if (!opt->no_header) {
+            rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+            if (rc == CISV_ITER_EOF) {
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                continue;
+            }
+            if (rc == CISV_ITER_ERROR) {
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                rows_set_error(rt->error, rt->error_len, "parse error while reading header: %s", path);
+                return CISV_ROWS_PARSE_ERROR;
+            }
+
+            if (!rt->have_header) {
+                if (owned_row_copy(&rt->header, fields, lengths, field_count, 0) != 0) {
+                    cisv_iterator_close(it);
+                    key_builder_destroy(&builder);
+                    return CISV_ROWS_IO_ERROR;
+                }
+                rt->have_header = 1;
+                if (opt->mode != CISV_ROWS_CAT) {
+                    cisv_rows_status_t status = resolve_key_indexes(
+                        opt->key_columns,
+                        opt->key_column_count,
+                        opt->key_indexes,
+                        opt->key_index_count,
+                        opt->use_key_indexes,
+                        fields,
+                        lengths,
+                        field_count,
+                        opt->no_header,
+                        &rt->source_key_indexes,
+                        &rt->source_key_count,
+                        rt->error,
+                        rt->error_len
+                    );
+                    if (status != CISV_ROWS_OK) {
+                        cisv_iterator_close(it);
+                        key_builder_destroy(&builder);
+                        return status;
+                    }
+                }
+            } else if (!headers_equal(&rt->header, fields, lengths, field_count)) {
+                rt->stats->header_mismatch_rows++;
+                if (!opt->ignore_header_mismatch) {
+                    cisv_iterator_close(it);
+                    key_builder_destroy(&builder);
+                    rows_set_error(rt->error, rt->error_len, "header mismatch");
+                    return CISV_ROWS_HEADER_MISMATCH;
+                }
+            }
+        } else if (opt->mode != CISV_ROWS_CAT && !rt->source_key_indexes) {
+            cisv_rows_status_t status = resolve_key_indexes(
+                opt->key_columns,
+                opt->key_column_count,
+                opt->key_indexes,
+                opt->key_index_count,
+                opt->use_key_indexes,
+                NULL,
+                NULL,
+                0,
+                opt->no_header,
+                &rt->source_key_indexes,
+                &rt->source_key_count,
+                rt->error,
+                rt->error_len
+            );
+            if (status != CISV_ROWS_OK) {
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                return status;
+            }
+        }
+
+        while ((rc = cisv_iterator_next(it, &fields, &lengths, &field_count)) == CISV_ITER_OK) {
+            rt->stats->input_rows++;
+            const char *key = NULL;
+            size_t key_len = 0;
+            int empty_key = 0;
+            int key_rc = build_row_key(fields, lengths, field_count,
+                                       rt->source_key_indexes, rt->source_key_count,
+                                       &builder, &key, &key_len, &empty_key);
+            if (key_rc == -2) {
+                rt->stats->malformed_rows++;
+                if (opt->csv_config.skip_lines_with_error) {
+                    rt->sequence++;
+                    continue;
+                }
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                rows_set_error(rt->error, rt->error_len, "row is missing a key field");
+                return CISV_ROWS_PARSE_ERROR;
+            }
+            if (key_rc != 0) {
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                return CISV_ROWS_IO_ERROR;
+            }
+            if (opt->drop_empty_key && empty_key) {
+                rt->stats->empty_key_rows++;
+                rt->sequence++;
+                continue;
+            }
+
+            uint64_t hash = rows_hash_bytes(key, key_len);
+            size_t shard = (size_t)hash & (shard_count - 1u);
+            if (write_external_key_record(candidate_shards[shard].file, (uint64_t)rt->sequence,
+                                          key, key_len, 1, &rt->stats->temp_bytes_written) != 0) {
+                cisv_iterator_close(it);
+                key_builder_destroy(&builder);
+                rows_set_error(rt->error, rt->error_len, "failed writing candidate temporary shard");
+                return CISV_ROWS_EXTERNAL_ERROR;
+            }
+            rt->sequence++;
+        }
+
+        cisv_iterator_close(it);
+        key_builder_destroy(&builder);
+        if (rc == CISV_ITER_ERROR) {
+            rt->stats->malformed_rows++;
+            rows_set_error(rt->error, rt->error_len, "parse error while reading input file: %s", path);
+            return CISV_ROWS_PARSE_ERROR;
+        }
+    }
+
+    return CISV_ROWS_OK;
+}
+
+static cisv_rows_status_t external_load_exclude_shard(cisv_rows_runtime_t *rt,
+                                                      const char *path,
+                                                      cisv_key_set_t *excluded) {
+    size_t expected = rows_file_size(path) / 16u;
+    if (key_set_init(excluded, expected > 0 ? expected : 1024u, rt->memory_limit) != 0) {
+        return CISV_ROWS_MEMORY_LIMIT;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        rows_set_error(rt->error, rt->error_len, "failed to read exclude temporary shard");
+        return CISV_ROWS_EXTERNAL_ERROR;
+    }
+
+    cisv_key_builder_t builder = {0};
+    for (;;) {
+        const char *key = NULL;
+        size_t key_len = 0;
+        int rc = read_external_key_record(f, NULL, &builder, 0, &key, &key_len,
+                                          &rt->stats->temp_bytes_read);
+        if (rc == 0) break;
+        if (rc < 0) {
+            fclose(f);
+            key_builder_destroy(&builder);
+            return CISV_ROWS_EXTERNAL_ERROR;
+        }
+        uint64_t hash = rows_hash_bytes(key, key_len);
+        int inserted = 0;
+        int insert_rc = key_set_insert_or_assign(excluded, key, key_len, hash,
+                                                 CISV_KEYSET_EMPTY, &inserted, NULL);
+        (void)inserted;
+        if (insert_rc == -2) {
+            fclose(f);
+            key_builder_destroy(&builder);
+            return CISV_ROWS_MEMORY_LIMIT;
+        }
+        if (insert_rc != 0) {
+            fclose(f);
+            key_builder_destroy(&builder);
+            return CISV_ROWS_EXTERNAL_ERROR;
+        }
+    }
+
+    fclose(f);
+    key_builder_destroy(&builder);
+    return CISV_ROWS_OK;
+}
+
+static cisv_rows_status_t external_process_candidate_shard(cisv_rows_runtime_t *rt,
+                                                           const char *candidate_path,
+                                                           const char *exclude_path,
+                                                           unsigned char *accepted_bits) {
+    cisv_key_set_t excluded;
+    cisv_key_set_t accepted;
+    memset(&excluded, 0, sizeof(excluded));
+    memset(&accepted, 0, sizeof(accepted));
+
+    cisv_rows_status_t status = CISV_ROWS_OK;
+    if (rt->options->exclude_file) {
+        status = external_load_exclude_shard(rt, exclude_path, &excluded);
+        if (status != CISV_ROWS_OK) goto done;
+    } else if (key_set_init(&excluded, 1024u, rt->memory_limit) != 0) {
+        status = CISV_ROWS_MEMORY_LIMIT;
+        goto done;
+    }
+
+    size_t expected = rows_file_size(candidate_path) / 24u;
+    if (key_set_init(&accepted, expected > 0 ? expected : 1024u, rt->memory_limit) != 0) {
+        status = CISV_ROWS_MEMORY_LIMIT;
+        goto done;
+    }
+
+    FILE *f = fopen(candidate_path, "rb");
+    if (!f) {
+        rows_set_error(rt->error, rt->error_len, "failed to read candidate temporary shard");
+        status = CISV_ROWS_EXTERNAL_ERROR;
+        goto done;
+    }
+
+    cisv_key_builder_t builder = {0};
+    for (;;) {
+        uint64_t seq = 0;
+        const char *key = NULL;
+        size_t key_len = 0;
+        int rc = read_external_key_record(f, &seq, &builder, 1, &key, &key_len,
+                                          &rt->stats->temp_bytes_read);
+        if (rc == 0) break;
+        if (rc < 0 || seq > SIZE_MAX) {
+            status = CISV_ROWS_EXTERNAL_ERROR;
+            break;
+        }
+
+        uint64_t hash = rows_hash_bytes(key, key_len);
+        if (rt->options->exclude_file && key_set_lookup(&excluded, key, key_len, hash, NULL)) {
+            rt->stats->excluded_rows++;
+            continue;
+        }
+
+        if (rt->options->mode == CISV_ROWS_FILTER_EXCLUDE) {
+            bitset_set(accepted_bits, (size_t)seq);
+            rt->stats->output_rows++;
+            continue;
+        }
+
+        if (key_set_lookup(&accepted, key, key_len, hash, NULL)) {
+            rt->stats->duplicate_rows++;
+            continue;
+        }
+
+        int inserted = 0;
+        int insert_rc = key_set_insert_or_assign(&accepted, key, key_len, hash,
+                                                 CISV_KEYSET_EMPTY, &inserted, NULL);
+        (void)inserted;
+        if (insert_rc == -2) {
+            status = CISV_ROWS_MEMORY_LIMIT;
+            break;
+        }
+        if (insert_rc != 0) {
+            status = CISV_ROWS_EXTERNAL_ERROR;
+            break;
+        }
+        bitset_set(accepted_bits, (size_t)seq);
+        rt->stats->output_rows++;
+    }
+
+    key_builder_destroy(&builder);
+    fclose(f);
+
+done:
+    key_set_destroy(&accepted);
+    key_set_destroy(&excluded);
+    return status;
+}
+
+static cisv_rows_status_t external_emit_output(cisv_rows_runtime_t *rt,
+                                               const unsigned char *accepted_bits) {
+    const cisv_rows_options_t *opt = rt->options;
+    if (!opt->no_header && rt->have_header) {
+        if (write_owned_row(rt, &rt->header) != 0) {
+            rows_set_error(rt->error, rt->error_len, "failed to write CSV header");
+            return CISV_ROWS_IO_ERROR;
+        }
+    }
+
+    size_t seq = 0;
+    for (size_t file_index = 0; file_index < opt->input_file_count; file_index++) {
+        const char *path = opt->input_files[file_index];
+        cisv_iterator_t *it = cisv_iterator_open(path, &opt->csv_config);
+        if (!it) {
+            rows_set_error(rt->error, rt->error_len, "failed to open input file: %s", path);
+            return CISV_ROWS_IO_ERROR;
+        }
+
+        const char **fields = NULL;
+        const size_t *lengths = NULL;
+        size_t field_count = 0;
+        int rc;
+        if (!opt->no_header) {
+            rc = cisv_iterator_next(it, &fields, &lengths, &field_count);
+            if (rc == CISV_ITER_EOF) {
+                cisv_iterator_close(it);
+                continue;
+            }
+            if (rc == CISV_ITER_ERROR) {
+                cisv_iterator_close(it);
+                rows_set_error(rt->error, rt->error_len, "parse error while reading header: %s", path);
+                return CISV_ROWS_PARSE_ERROR;
+            }
+        }
+
+        while ((rc = cisv_iterator_next(it, &fields, &lengths, &field_count)) == CISV_ITER_OK) {
+            if (bitset_get(accepted_bits, seq)) {
+                if (write_row(rt, fields, lengths, field_count) != 0) {
+                    cisv_iterator_close(it);
+                    rows_set_error(rt->error, rt->error_len, "failed to write output row");
+                    return CISV_ROWS_IO_ERROR;
+                }
+            }
+            seq++;
+        }
+
+        cisv_iterator_close(it);
+        if (rc == CISV_ITER_ERROR) {
+            rows_set_error(rt->error, rt->error_len, "parse error while reading input file: %s", path);
+            return CISV_ROWS_PARSE_ERROR;
+        }
+    }
+    return CISV_ROWS_OK;
+}
+
+static cisv_rows_status_t cisv_rows_execute_external(const cisv_rows_options_t *options,
+                                                     cisv_rows_stats_t *stats,
+                                                     char *error,
+                                                     size_t error_len) {
+    if (options->mode == CISV_ROWS_CAT) {
+        rows_set_error(error, error_len, "external mode is not needed for cat rows");
+        return CISV_ROWS_EXTERNAL_ERROR;
+    }
+    if (options->keep == CISV_KEEP_LAST) {
+        rows_set_error(error, error_len, "external mode currently supports --keep first only");
+        return CISV_ROWS_EXTERNAL_ERROR;
+    }
+
+    cisv_rows_runtime_t rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.options = options;
+    rt.stats = stats;
+    rt.error = error;
+    rt.error_len = error_len;
+    rt.memory_limit = options->memory_limit;
+
+    cisv_writer_config writer_config = {
+        .delimiter = options->csv_config.delimiter ? options->csv_config.delimiter : ',',
+        .quote_char = options->csv_config.quote ? options->csv_config.quote : '"',
+        .always_quote = 0,
+        .use_crlf = 0,
+        .null_string = "",
+        .buffer_size = 1 << 20
+    };
+    rt.writer = cisv_writer_create_config(options->output, &writer_config);
+    if (!rt.writer) {
+        rows_set_error(error, error_len, "failed to create CSV writer");
+        return CISV_ROWS_IO_ERROR;
+    }
+
+    size_t shard_count = rows_choose_external_shards(options);
+    if (shard_count == 0 || (shard_count & (shard_count - 1u)) != 0) {
+        cisv_writer_destroy(rt.writer);
+        return CISV_ROWS_EXTERNAL_ERROR;
+    }
+
+    cisv_temp_shard_t *candidate_shards = NULL;
+    cisv_temp_shard_t *exclude_shards = NULL;
+    const char *tmp_dir = rows_tmp_dir(options);
+    cisv_rows_status_t status = CISV_ROWS_OK;
+    unsigned char *accepted_bits = NULL;
+
+    if (temp_shards_create(&candidate_shards, shard_count, tmp_dir, "cand", error, error_len) != 0 ||
+        temp_shards_create(&exclude_shards, shard_count, tmp_dir, "excl", error, error_len) != 0) {
+        status = CISV_ROWS_EXTERNAL_ERROR;
+        goto done;
+    }
+
+    status = external_partition_exclude(&rt, exclude_shards, shard_count);
+    if (status != CISV_ROWS_OK) goto done;
+    status = external_partition_sources(&rt, candidate_shards, shard_count);
+    if (status != CISV_ROWS_OK) goto done;
+
+    temp_shards_close(candidate_shards, shard_count);
+    temp_shards_close(exclude_shards, shard_count);
+
+    size_t bitset_bytes = (rt.sequence + 7u) / 8u;
+    if (options->memory_limit && bitset_bytes > options->memory_limit) {
+        status = CISV_ROWS_MEMORY_LIMIT;
+        goto done;
+    }
+    accepted_bits = calloc(bitset_bytes ? bitset_bytes : 1u, 1u);
+    if (!accepted_bits) {
+        status = CISV_ROWS_IO_ERROR;
+        goto done;
+    }
+
+    for (size_t i = 0; i < shard_count; i++) {
+        status = external_process_candidate_shard(&rt, candidate_shards[i].path,
+                                                  exclude_shards[i].path, accepted_bits);
+        if (status != CISV_ROWS_OK) goto done;
+    }
+
+    status = external_emit_output(&rt, accepted_bits);
+    if (status != CISV_ROWS_OK) goto done;
+
+    if (cisv_writer_flush(rt.writer) != 0) {
+        rows_set_error(error, error_len, "failed to flush CSV writer");
+        status = CISV_ROWS_IO_ERROR;
+        goto done;
+    }
+    stats->bytes_written = cisv_writer_bytes_written(rt.writer);
+
+done:
+    free(accepted_bits);
+    temp_shards_destroy(candidate_shards, shard_count);
+    temp_shards_destroy(exclude_shards, shard_count);
+    free(rt.source_key_indexes);
+    owned_row_destroy(&rt.header);
+    if (rt.writer) {
+        if (status == CISV_ROWS_OK && stats->bytes_written == 0) {
+            stats->bytes_written = cisv_writer_bytes_written(rt.writer);
+        }
+        cisv_writer_destroy(rt.writer);
+    }
+    return status;
+}
+
 void cisv_rows_options_init(cisv_rows_options_t *options) {
     if (!options) return;
     memset(options, 0, sizeof(*options));
@@ -996,10 +1724,6 @@ static cisv_rows_status_t validate_options(const cisv_rows_options_t *opt,
     if (!opt->input_files || opt->input_file_count == 0) {
         rows_set_error(error, error_len, "at least one input file is required");
         return CISV_ROWS_USAGE_ERROR;
-    }
-    if (opt->external) {
-        rows_set_error(error, error_len, "external mode is not available in this build");
-        return CISV_ROWS_EXTERNAL_ERROR;
     }
     if (opt->mode != CISV_ROWS_CAT &&
         !opt->use_key_indexes &&
@@ -1065,6 +1789,18 @@ cisv_rows_status_t cisv_rows_execute(const cisv_rows_options_t *options,
         else stats->bytes_read += sz;
     }
 
+    double start = rows_now_seconds();
+
+    if (options->external) {
+        status = cisv_rows_execute_external(options, stats, error, error_len);
+        stats->elapsed_seconds = rows_now_seconds() - start;
+        stats->peak_rss_bytes = rows_peak_rss_bytes();
+        if (status != CISV_ROWS_OK && error && error_len > 0 && error[0] == '\0') {
+            rows_set_error(error, error_len, "%s", cisv_rows_status_name(status));
+        }
+        return status;
+    }
+
     cisv_rows_runtime_t rt;
     memset(&rt, 0, sizeof(rt));
     rt.options = options;
@@ -1072,8 +1808,6 @@ cisv_rows_status_t cisv_rows_execute(const cisv_rows_options_t *options,
     rt.error = error;
     rt.error_len = error_len;
     rt.memory_limit = options->memory_limit;
-
-    double start = rows_now_seconds();
 
     if (key_set_init(&rt.accepted, estimate_source_rows(options), options->memory_limit) != 0 ||
         key_set_init(&rt.excluded, estimate_exclude_rows(options), options->memory_limit) != 0) {

@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include "cisv/parser.h"
 #include "cisv/writer.h"
 #include "cisv/transformer.h"
@@ -3100,6 +3101,77 @@ void test_rows_dedup_composite_keys_are_structured(void) {
     }
 }
 
+void test_rows_external_merge_cleans_temp_files(void) {
+    TEST("rows external merge preserves semantics and cleans temp files");
+
+    char newest[256], middle[256], deleted[256], tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/test_cisv_ext_%d", getpid());
+    mkdir(tmpdir, 0700);
+
+    if (write_temp_csv_named("ext_newest", "Id,Name\n2,new\n3,keep\n4,del\n", newest, sizeof(newest)) != 0 ||
+        write_temp_csv_named("ext_middle", "Id,Name\n1,mid1\n2,dup\n4,del2\n", middle, sizeof(middle)) != 0 ||
+        write_temp_csv_named("ext_deleted", "Id\n4\n", deleted, sizeof(deleted)) != 0) {
+        rmdir(tmpdir);
+        FAIL("failed to create external merge fixtures");
+        return;
+    }
+
+    FILE *out = tmpfile();
+    if (!out) {
+        unlink(newest); unlink(middle); unlink(deleted); rmdir(tmpdir);
+        FAIL("tmpfile failed");
+        return;
+    }
+
+    const char *inputs[] = {newest, middle};
+    const char *keys[] = {"Id"};
+    cisv_rows_options_t options;
+    cisv_rows_options_init(&options);
+    options.mode = CISV_ROWS_MERGE;
+    options.input_files = inputs;
+    options.input_file_count = 2;
+    options.key_columns = keys;
+    options.key_column_count = 1;
+    options.exclude_file = deleted;
+    options.exclude_key_columns = keys;
+    options.exclude_key_column_count = 1;
+    options.external = 1;
+    options.memory_limit = 1024 * 1024;
+    options.tmp_dir = tmpdir;
+    options.output = out;
+
+    cisv_rows_stats_t stats;
+    char error[256] = {0};
+    cisv_rows_status_t status = cisv_rows_execute(&options, &stats, error, sizeof(error));
+
+    char buf[512];
+    int read_ok = read_tmpfile_string(out, buf, sizeof(buf)) == 0;
+    fclose(out);
+    unlink(newest); unlink(middle); unlink(deleted);
+    int tmp_clean = rmdir(tmpdir) == 0;
+
+    const char *expected = "Id,Name\n2,new\n3,keep\n1,mid1\n";
+    if (status == CISV_ROWS_OK &&
+        read_ok &&
+        strcmp(buf, expected) == 0 &&
+        stats.input_rows == 6 &&
+        stats.output_rows == 3 &&
+        stats.duplicate_rows == 1 &&
+        stats.excluded_rows == 2 &&
+        stats.temp_bytes_written > 0 &&
+        stats.temp_bytes_read > 0 &&
+        tmp_clean) {
+        PASS();
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "status=%d error=%s out=%zu dup=%zu excl=%zu tmp_clean=%d got=%s",
+                 status, error, stats.output_rows, stats.duplicate_rows,
+                 stats.excluded_rows, tmp_clean, read_ok ? buf : "<read failed>");
+        FAIL(msg);
+    }
+}
+
 int main(void) {
     printf("CISV Core Library Tests\n");
     printf("========================\n\n");
@@ -3196,6 +3268,7 @@ int main(void) {
     test_rows_merge_dedup_exclude_first();
     test_rows_dedup_keep_last_order();
     test_rows_dedup_composite_keys_are_structured();
+    test_rows_external_merge_cleans_temp_files();
 
     // Summary
     printf("\n========================\n");
