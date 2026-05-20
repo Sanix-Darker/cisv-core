@@ -1028,7 +1028,7 @@ static size_t estimate_source_rows(const cisv_rows_options_t *opt) {
         if (sz > SIZE_MAX - bytes) return SIZE_MAX / 64;
         bytes += sz;
     }
-    size_t estimate = bytes / 64;
+    size_t estimate = bytes / 128;
     return estimate > 0 ? estimate : 1024;
 }
 
