@@ -9,6 +9,7 @@ Core C library for CISV with SIMD optimizations (AVX-512/AVX2 + scalar fallback)
 - SIMD-accelerated CSV parsing
 - Streaming parser and iterator API
 - Fast row counting API
+- Native row operations for cat, dedup, anti-join filtering, and merge
 - Configurable delimiter, quote, escape, comments, trimming
 - Transform hooks and parallel chunk support
 
@@ -56,6 +57,21 @@ while (cisv_iterator_next(it, &fields, &lengths, &field_count) == CISV_ITER_OK) 
 }
 cisv_iterator_close(it);
 ```
+
+### ROW MERGE OPERATIONS
+
+`cisv-core` exposes `cisv_rows_execute()` for first-class CSV row operations:
+
+- concatenate multiple files with one header
+- deduplicate by one or more key columns
+- filter rows whose key exists in another CSV
+- merge rows with exclusion before deduplication
+- emit counters for orchestration
+- use in-memory key sets or external partitioning
+
+The `keep first` path stores key state only and streams accepted rows. External
+mode partitions key/sequence records to temporary shards and emits accepted rows
+in original input order after per-shard deduplication.
 
 More runnable examples: [`examples/`](./examples)
 
