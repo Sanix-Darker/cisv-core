@@ -1906,6 +1906,46 @@ void test_count_rows_final_row_without_newline(void) {
     }
 }
 
+void test_count_rows_truncated_quoted_eof_counts_partial_row(void) {
+    TEST("count_rows truncated quoted EOF counts partial row");
+
+    const char *path = write_temp_csv("a,b\n1,\"truncated");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    size_t count = cisv_parser_count_rows(path);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
+void test_count_rows_dangling_escape_eof_counts_partial_row(void) {
+    TEST("count_rows dangling escape EOF counts partial row");
+
+    const char *path = write_temp_csv("a,b\n1,\"truncated\\");
+    if (!path) { FAIL("failed to create temp file"); return; }
+
+    cisv_config config;
+    cisv_config_init(&config);
+    config.escape = '\\';
+
+    size_t count = cisv_parser_count_rows_with_config(path, &config);
+    unlink(path);
+
+    if (count == 2) {
+        PASS();
+    } else {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "expected 2, got %zu", count);
+        FAIL(buf);
+    }
+}
+
 void test_count_rows_cr_only_line_endings(void) {
     TEST("count_rows supports CR-only line endings");
 
@@ -3236,6 +3276,8 @@ int main(void) {
     test_count_rows_skip_empty_preserves_empty_fields();
     test_count_rows_trimmed_comment_and_quoted_comment();
     test_count_rows_final_row_without_newline();
+    test_count_rows_truncated_quoted_eof_counts_partial_row();
+    test_count_rows_dangling_escape_eof_counts_partial_row();
     test_count_rows_cr_only_line_endings();
     test_count_rows_mixed_line_endings_no_quotes();
     test_count_rows_empty_file();

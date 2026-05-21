@@ -2251,14 +2251,12 @@ static size_t count_rows_quote_aware(const uint8_t *data, size_t size,
                 const uint8_t *special = count_min_ptr(quote_pos, escape_pos);
 
                 if (!special) {
-                    *ok = false;
-                    return 0;
+                    return rows + 1;
                 }
 
                 if (escape_pos && special == escape_pos) {
                     if (special + 1 >= end) {
-                        *ok = false;
-                        return 0;
+                        return rows + 1;
                     }
                     p = special + 2;
                     continue;
@@ -2421,8 +2419,9 @@ static size_t count_rows_semantic(const uint8_t *data, size_t size,
         if (in_quote) {
             if (escape_char != '\0' && c == escape_char) {
                 if (i + 1 >= size) {
-                    *ok = false;
-                    return 0;
+                    count_finish_field(&counter, data, field_start, size, true);
+                    count_finish_row(&counter, false);
+                    return counter.rows;
                 }
                 i++;
             } else if (c == quote_char) {
@@ -2528,8 +2527,9 @@ static size_t count_rows_semantic(const uint8_t *data, size_t size,
     }
 
     if (in_quote) {
-        *ok = false;
-        return 0;
+        count_finish_field(&counter, data, field_start, size, true);
+        count_finish_row(&counter, false);
+        return counter.rows;
     }
 
     if (after_quote) {
