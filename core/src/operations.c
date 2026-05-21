@@ -2,11 +2,13 @@
 #include "cisv/writer.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -1784,6 +1786,418 @@ static size_t estimate_exclude_rows(const cisv_rows_options_t *opt) {
     return estimate > 0 ? estimate : 1024;
 }
 
+typedef struct {
+    int fd;
+    const char *data;
+    size_t size;
+} cisv_rows_mmap_t;
+
+static void rows_mmap_close(cisv_rows_mmap_t *map) {
+    if (!map) return;
+    if (map->data && map->data != MAP_FAILED) munmap((void *)map->data, map->size);
+    if (map->fd >= 0) close(map->fd);
+    map->fd = -1;
+    map->data = NULL;
+    map->size = 0;
+}
+
+static int rows_mmap_open_simple_lf(const char *path, cisv_rows_mmap_t *map) {
+    memset(map, 0, sizeof(*map));
+    map->fd = -1;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    const char *data = (const char *)mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return -1;
+    }
+
+    size_t size = (size_t)st.st_size;
+    if (size >= 3 &&
+        (unsigned char)data[0] == 0xefu &&
+        (unsigned char)data[1] == 0xbbu &&
+        (unsigned char)data[2] == 0xbfu) {
+        munmap((void *)data, size);
+        close(fd);
+        return 0;
+    }
+    if (memchr(data, '\r', size) || memchr(data, '"', size)) {
+        munmap((void *)data, size);
+        close(fd);
+        return 0;
+    }
+
+    map->fd = fd;
+    map->data = data;
+    map->size = size;
+    return 1;
+}
+
+static int rows_simple_header(const cisv_rows_mmap_t *map,
+                              const char **header,
+                              size_t *header_len,
+                              const char **data_start) {
+    const char *start = map->data;
+    const char *end = map->data + map->size;
+    const char *nl = memchr(start, '\n', map->size);
+    if (!nl) {
+        *header = start;
+        *header_len = map->size;
+        *data_start = end;
+        return 0;
+    }
+    *header = start;
+    *header_len = (size_t)(nl - start);
+    *data_start = nl + 1;
+    return 0;
+}
+
+static int rows_simple_header_index(const char *header,
+                                    size_t header_len,
+                                    char delimiter,
+                                    const char *name) {
+    if (!name) return -1;
+    size_t name_len = strlen(name);
+    size_t col = 0;
+    const char *field = header;
+    const char *p = header;
+    const char *end = header + header_len;
+
+    for (;;) {
+        if (p == end || *p == delimiter) {
+            size_t len = (size_t)(p - field);
+            if (len == name_len && memcmp(field, name, len) == 0) return (int)col;
+            if (p == end) break;
+            col++;
+            field = p + 1;
+        }
+        p++;
+    }
+    return -1;
+}
+
+static int rows_simple_key_field(const char *line,
+                                 size_t line_len,
+                                 char delimiter,
+                                 size_t key_index,
+                                 const char **key,
+                                 size_t *key_len,
+                                 int *empty_key) {
+    size_t col = 0;
+    const char *field = line;
+    const char *p = line;
+    const char *end = line + line_len;
+
+    for (;;) {
+        if (p == end || *p == delimiter) {
+            if (col == key_index) {
+                *key = field;
+                *key_len = (size_t)(p - field);
+                *empty_key = (*key_len == 0);
+                return 0;
+            }
+            if (p == end) break;
+            col++;
+            field = p + 1;
+        }
+        p++;
+    }
+    return -2;
+}
+
+static int rows_simple_write_line(FILE *out,
+                                  const char *line,
+                                  size_t line_len,
+                                  cisv_rows_stats_t *stats) {
+    if (line_len > 0 && fwrite(line, 1, line_len, out) != line_len) return -1;
+    if (fputc('\n', out) == EOF) return -1;
+    stats->bytes_written += line_len + 1u;
+    return 0;
+}
+
+static int rows_options_allow_simple_lf(const cisv_rows_options_t *opt) {
+    const cisv_config *cfg = &opt->csv_config;
+    char delimiter = cfg->delimiter ? cfg->delimiter : ',';
+    char quote = cfg->quote ? cfg->quote : '"';
+    if (delimiter != ',' || quote != '"' || cfg->escape != '\0') return 0;
+    if (cfg->trim || cfg->skip_empty_lines || cfg->comment != 0) return 0;
+    if (cfg->from_line > 1 || cfg->to_line != 0 || cfg->max_row_size != 0) return 0;
+    if (cfg->skip_lines_with_error || cfg->relaxed) return 0;
+    if (opt->external || opt->keep != CISV_KEEP_FIRST || opt->ignore_header_mismatch) return 0;
+    if (opt->no_header) return 0;
+    if (opt->mode == CISV_ROWS_CAT) return 0;
+    if (opt->use_key_indexes) {
+        if (!opt->key_indexes || opt->key_index_count != 1) return 0;
+    } else if (!opt->key_columns || opt->key_column_count != 1) {
+        return 0;
+    }
+    if (opt->exclude_file) {
+        if (opt->use_exclude_key_indexes) {
+            if (!opt->exclude_key_indexes || opt->exclude_key_index_count != 1) return 0;
+        } else if (!opt->exclude_key_columns || opt->exclude_key_column_count != 1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static cisv_rows_status_t rows_simple_load_excludes(cisv_rows_runtime_t *rt,
+                                                    const cisv_rows_mmap_t *exclude_map,
+                                                    size_t key_index) {
+    if (!rt->options->exclude_file) return CISV_ROWS_OK;
+
+    const char *header = NULL;
+    const char *p = NULL;
+    size_t header_len = 0;
+    rows_simple_header(exclude_map, &header, &header_len, &p);
+    (void)header;
+    (void)header_len;
+
+    const char *end = exclude_map->data + exclude_map->size;
+    while (p < end) {
+        const char *line = p;
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = nl ? nl : end;
+        size_t line_len = (size_t)(line_end - line);
+        const char *key = NULL;
+        size_t key_len = 0;
+        int empty_key = 0;
+        int key_rc = rows_simple_key_field(line, line_len, ',', key_index, &key, &key_len, &empty_key);
+        if (key_rc == -2) {
+            rt->stats->malformed_rows++;
+            rows_set_error(rt->error, rt->error_len, "missing exclude key field in %s", rt->options->exclude_file);
+            return CISV_ROWS_PARSE_ERROR;
+        }
+        if (key_rc != 0) return CISV_ROWS_IO_ERROR;
+        if (!(rt->options->drop_empty_key && empty_key)) {
+            uint64_t hash = rows_hash_bytes(key, key_len);
+            int inserted = 0;
+            int insert_rc = key_set_insert_or_assign(&rt->excluded, key, key_len, hash,
+                                                     CISV_KEYSET_EMPTY, &inserted, NULL);
+            (void)inserted;
+            if (insert_rc == -2) return CISV_ROWS_MEMORY_LIMIT;
+            if (insert_rc != 0) return CISV_ROWS_IO_ERROR;
+        }
+        p = nl ? nl + 1 : end;
+    }
+    return CISV_ROWS_OK;
+}
+
+static cisv_rows_status_t rows_try_execute_simple_lf(const cisv_rows_options_t *options,
+                                                     cisv_rows_stats_t *stats,
+                                                     char *error,
+                                                     size_t error_len,
+                                                     int *handled) {
+    *handled = 0;
+    if (!rows_options_allow_simple_lf(options)) return CISV_ROWS_OK;
+
+    size_t map_count = options->input_file_count + (options->exclude_file ? 1u : 0u);
+    cisv_rows_mmap_t *maps = calloc(map_count, sizeof(*maps));
+    if (!maps) return CISV_ROWS_IO_ERROR;
+    for (size_t i = 0; i < map_count; i++) maps[i].fd = -1;
+
+    for (size_t i = 0; i < options->input_file_count; i++) {
+        int rc = rows_mmap_open_simple_lf(options->input_files[i], &maps[i]);
+        if (rc != 1) {
+            for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+            free(maps);
+            return CISV_ROWS_OK;
+        }
+    }
+    cisv_rows_mmap_t *exclude_map = NULL;
+    if (options->exclude_file) {
+        exclude_map = &maps[options->input_file_count];
+        int rc = rows_mmap_open_simple_lf(options->exclude_file, exclude_map);
+        if (rc != 1) {
+            for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+            free(maps);
+            return CISV_ROWS_OK;
+        }
+    }
+
+    const char *first_header = NULL;
+    const char *first_data = NULL;
+    size_t first_header_len = 0;
+    rows_simple_header(&maps[0], &first_header, &first_header_len, &first_data);
+
+    size_t source_key_index = 0;
+    if (options->use_key_indexes) {
+        source_key_index = options->key_indexes[0];
+    } else {
+        int idx = rows_simple_header_index(first_header, first_header_len, ',', options->key_columns[0]);
+        if (idx < 0) {
+            rows_set_error(error, error_len, "missing key column: %s", options->key_columns[0]);
+            for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+            free(maps);
+            *handled = 1;
+            return CISV_ROWS_MISSING_KEY;
+        }
+        source_key_index = (size_t)idx;
+    }
+
+    for (size_t i = 1; i < options->input_file_count; i++) {
+        const char *header = NULL;
+        const char *data_start = NULL;
+        size_t header_len = 0;
+        rows_simple_header(&maps[i], &header, &header_len, &data_start);
+        (void)data_start;
+        if (header_len != first_header_len || memcmp(header, first_header, first_header_len) != 0) {
+            stats->header_mismatch_rows++;
+            rows_set_error(error, error_len, "header mismatch");
+            for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+            free(maps);
+            *handled = 1;
+            return CISV_ROWS_HEADER_MISMATCH;
+        }
+    }
+
+    size_t exclude_key_index = 0;
+    if (options->exclude_file) {
+        const char *exclude_header = NULL;
+        const char *exclude_data = NULL;
+        size_t exclude_header_len = 0;
+        rows_simple_header(exclude_map, &exclude_header, &exclude_header_len, &exclude_data);
+        (void)exclude_data;
+        if (options->use_exclude_key_indexes) {
+            exclude_key_index = options->exclude_key_indexes[0];
+        } else {
+            int idx = rows_simple_header_index(exclude_header, exclude_header_len, ',',
+                                               options->exclude_key_columns[0]);
+            if (idx < 0) {
+                rows_set_error(error, error_len, "missing key column: %s", options->exclude_key_columns[0]);
+                for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+                free(maps);
+                *handled = 1;
+                return CISV_ROWS_MISSING_KEY;
+            }
+            exclude_key_index = (size_t)idx;
+        }
+    }
+
+    cisv_rows_runtime_t rt;
+    memset(&rt, 0, sizeof(rt));
+    rt.options = options;
+    rt.stats = stats;
+    rt.error = error;
+    rt.error_len = error_len;
+    rt.memory_limit = options->memory_limit;
+
+    cisv_rows_status_t status = CISV_ROWS_OK;
+    if (key_set_init(&rt.accepted, estimate_source_rows(options), options->memory_limit) != 0 ||
+        key_set_init(&rt.excluded, estimate_exclude_rows(options), options->memory_limit) != 0) {
+        status = CISV_ROWS_MEMORY_LIMIT;
+        goto done;
+    }
+
+    status = rows_simple_load_excludes(&rt, exclude_map, exclude_key_index);
+    if (status != CISV_ROWS_OK) goto done;
+
+    if (rows_simple_write_line(options->output, first_header, first_header_len, stats) != 0) {
+        rows_set_error(error, error_len, "failed to write CSV header");
+        status = CISV_ROWS_IO_ERROR;
+        goto done;
+    }
+
+    for (size_t file_index = 0; file_index < options->input_file_count; file_index++) {
+        const char *header = NULL;
+        const char *p = NULL;
+        size_t header_len = 0;
+        rows_simple_header(&maps[file_index], &header, &header_len, &p);
+        (void)header;
+        (void)header_len;
+
+        const char *end = maps[file_index].data + maps[file_index].size;
+        while (p < end) {
+            const char *line = p;
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            const char *line_end = nl ? nl : end;
+            size_t line_len = (size_t)(line_end - line);
+            const char *key = NULL;
+            size_t key_len = 0;
+            int empty_key = 0;
+
+            stats->input_rows++;
+            int key_rc = rows_simple_key_field(line, line_len, ',', source_key_index,
+                                               &key, &key_len, &empty_key);
+            if (key_rc == -2) {
+                stats->malformed_rows++;
+                rows_set_error(error, error_len, "row is missing a key field");
+                status = CISV_ROWS_PARSE_ERROR;
+                goto done;
+            }
+            if (key_rc != 0) {
+                status = CISV_ROWS_IO_ERROR;
+                goto done;
+            }
+
+            if (options->drop_empty_key && empty_key) {
+                stats->empty_key_rows++;
+                p = nl ? nl + 1 : end;
+                continue;
+            }
+
+            uint64_t hash = rows_hash_bytes(key, key_len);
+            if (options->exclude_file && key_set_lookup(&rt.excluded, key, key_len, hash, NULL)) {
+                stats->excluded_rows++;
+                p = nl ? nl + 1 : end;
+                continue;
+            }
+
+            if (options->mode != CISV_ROWS_FILTER_EXCLUDE) {
+                int inserted = 0;
+                int insert_rc = key_set_insert_or_assign(&rt.accepted, key, key_len, hash,
+                                                         CISV_KEYSET_EMPTY, &inserted, NULL);
+                if (insert_rc == -2) {
+                    status = CISV_ROWS_MEMORY_LIMIT;
+                    goto done;
+                }
+                if (insert_rc != 0) {
+                    status = CISV_ROWS_IO_ERROR;
+                    goto done;
+                }
+                if (!inserted) {
+                    stats->duplicate_rows++;
+                    p = nl ? nl + 1 : end;
+                    continue;
+                }
+                if (!rows_memory_check(&rt)) {
+                    status = CISV_ROWS_MEMORY_LIMIT;
+                    goto done;
+                }
+            }
+
+            if (rows_simple_write_line(options->output, line, line_len, stats) != 0) {
+                rows_set_error(error, error_len, "failed to write output row");
+                status = CISV_ROWS_IO_ERROR;
+                goto done;
+            }
+            stats->output_rows++;
+            p = nl ? nl + 1 : end;
+        }
+    }
+
+    if (fflush(options->output) != 0) {
+        rows_set_error(error, error_len, "failed to flush CSV writer");
+        status = CISV_ROWS_IO_ERROR;
+    }
+
+done:
+    key_set_destroy(&rt.accepted);
+    key_set_destroy(&rt.excluded);
+    for (size_t j = 0; j < map_count; j++) rows_mmap_close(&maps[j]);
+    free(maps);
+    *handled = 1;
+    return status;
+}
+
 cisv_rows_status_t cisv_rows_execute(const cisv_rows_options_t *options,
                                      cisv_rows_stats_t *stats,
                                      char *error,
@@ -1811,6 +2225,17 @@ cisv_rows_status_t cisv_rows_execute(const cisv_rows_options_t *options,
     }
 
     double start = rows_now_seconds();
+
+    int simple_handled = 0;
+    status = rows_try_execute_simple_lf(options, stats, error, error_len, &simple_handled);
+    if (simple_handled) {
+        stats->elapsed_seconds = rows_now_seconds() - start;
+        stats->peak_rss_bytes = rows_peak_rss_bytes();
+        if (status != CISV_ROWS_OK && error && error_len > 0 && error[0] == '\0') {
+            rows_set_error(error, error_len, "%s", cisv_rows_status_name(status));
+        }
+        return status;
+    }
 
     if (options->external) {
         status = cisv_rows_execute_external(options, stats, error, error_len);

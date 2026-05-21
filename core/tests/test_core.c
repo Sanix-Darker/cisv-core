@@ -3141,6 +3141,66 @@ void test_rows_dedup_composite_keys_are_structured(void) {
     }
 }
 
+void test_rows_merge_quoted_data_uses_general_parser(void) {
+    TEST("rows merge quoted data preserves semantics");
+
+    char newest[256], middle[256], deleted[256];
+    if (write_temp_csv_named("quoted_newest", "Id,Name\n2,\"new, quoted\"\n1,keep\n", newest, sizeof(newest)) != 0 ||
+        write_temp_csv_named("quoted_middle", "Id,Name\n2,dup\n3,deleted\n", middle, sizeof(middle)) != 0 ||
+        write_temp_csv_named("quoted_deleted", "Id\n3\n", deleted, sizeof(deleted)) != 0) {
+        FAIL("failed to create quoted merge fixtures");
+        return;
+    }
+
+    FILE *out = tmpfile();
+    if (!out) {
+        unlink(newest); unlink(middle); unlink(deleted);
+        FAIL("tmpfile failed");
+        return;
+    }
+
+    const char *inputs[] = {newest, middle};
+    const char *keys[] = {"Id"};
+    cisv_rows_options_t options;
+    cisv_rows_options_init(&options);
+    options.mode = CISV_ROWS_MERGE;
+    options.input_files = inputs;
+    options.input_file_count = 2;
+    options.key_columns = keys;
+    options.key_column_count = 1;
+    options.exclude_file = deleted;
+    options.exclude_key_columns = keys;
+    options.exclude_key_column_count = 1;
+    options.output = out;
+
+    cisv_rows_stats_t stats;
+    char error[256] = {0};
+    cisv_rows_status_t status = cisv_rows_execute(&options, &stats, error, sizeof(error));
+
+    char buf[512];
+    int read_ok = read_tmpfile_string(out, buf, sizeof(buf)) == 0;
+    fclose(out);
+    unlink(newest); unlink(middle); unlink(deleted);
+
+    const char *expected = "Id,Name\n2,\"new, quoted\"\n1,keep\n";
+    if (status == CISV_ROWS_OK &&
+        read_ok &&
+        strcmp(buf, expected) == 0 &&
+        stats.input_rows == 4 &&
+        stats.output_rows == 2 &&
+        stats.duplicate_rows == 1 &&
+        stats.excluded_rows == 1) {
+        PASS();
+    } else {
+        char msg[1024];
+        snprintf(msg, sizeof(msg),
+                 "status=%d error=%s input=%zu output=%zu dup=%zu excl=%zu got=%s",
+                 status, error, stats.input_rows, stats.output_rows,
+                 stats.duplicate_rows, stats.excluded_rows, read_ok ? buf : "<read failed>");
+        FAIL(msg);
+    }
+}
+
 void test_rows_external_merge_cleans_temp_files(void) {
     TEST("rows external merge preserves semantics and cleans temp files");
 
@@ -3310,6 +3370,7 @@ int main(void) {
     test_rows_merge_dedup_exclude_first();
     test_rows_dedup_keep_last_order();
     test_rows_dedup_composite_keys_are_structured();
+    test_rows_merge_quoted_data_uses_general_parser();
     test_rows_external_merge_cleans_temp_files();
 
     // Summary
