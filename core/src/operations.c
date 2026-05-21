@@ -233,12 +233,6 @@ static int key_set_rehash(cisv_key_set_t *set, size_t new_capacity) {
     return 0;
 }
 
-static int key_set_grow_if_needed(cisv_key_set_t *set) {
-    if ((set->count + 1) * 10 < set->capacity * 7) return 0;
-    if (set->capacity > SIZE_MAX / 2) return -1;
-    return key_set_rehash(set, set->capacity << 1);
-}
-
 static int key_set_reserve_arena(cisv_key_set_t *set, size_t add) {
     if (add == 0) return 0;
     if (add > SIZE_MAX - set->arena_len) return -1;
@@ -292,8 +286,6 @@ static int key_set_insert_or_assign(cisv_key_set_t *set,
     if (inserted) *inserted = 0;
     if (old_row_index) *old_row_index = CISV_KEYSET_EMPTY;
 
-    int grow_rc = key_set_grow_if_needed(set);
-    if (grow_rc != 0) return grow_rc;
     if (key_len > UINT32_MAX) return -1;
     if (row_index != CISV_KEYSET_EMPTY && row_index >= CISV_KEYSET_ROW_EMPTY) return -1;
 
@@ -310,6 +302,24 @@ static int key_set_insert_or_assign(cisv_key_set_t *set,
             ? CISV_KEYSET_ROW_EMPTY
             : (uint32_t)row_index;
         return 0;
+    }
+
+    if ((set->count + 1) * 10 >= set->capacity * 7) {
+        if (set->capacity > SIZE_MAX / 2) return -1;
+        int grow_rc = key_set_rehash(set, set->capacity << 1);
+        if (grow_rc != 0) return grow_rc;
+        if (key_set_find_slot(set, key, key_len, hash, &slot, &found) != 0) return -1;
+        if (found) {
+            if (old_row_index) {
+                *old_row_index = set->entries[slot].row_index == CISV_KEYSET_ROW_EMPTY
+                    ? CISV_KEYSET_EMPTY
+                    : (size_t)set->entries[slot].row_index;
+            }
+            set->entries[slot].row_index = row_index == CISV_KEYSET_EMPTY
+                ? CISV_KEYSET_ROW_EMPTY
+                : (uint32_t)row_index;
+            return 0;
+        }
     }
 
     int reserve_rc = key_set_reserve_arena(set, key_len);
@@ -776,17 +786,16 @@ static cisv_rows_status_t process_source_row(cisv_rows_runtime_t *rt,
     }
 
     if (opt->keep == CISV_KEEP_FIRST) {
-        if (key_set_lookup(&rt->accepted, key, key_len, hash, NULL)) {
-            rt->stats->duplicate_rows++;
-            rt->sequence++;
-            return CISV_ROWS_OK;
-        }
-
         int inserted = 0;
         int insert_rc = key_set_insert_or_assign(&rt->accepted, key, key_len, hash,
                                                  CISV_KEYSET_EMPTY, &inserted, NULL);
         if (insert_rc == -2) return CISV_ROWS_MEMORY_LIMIT;
         if (insert_rc != 0) return CISV_ROWS_IO_ERROR;
+        if (!inserted) {
+            rt->stats->duplicate_rows++;
+            rt->sequence++;
+            return CISV_ROWS_OK;
+        }
         if (!rows_memory_check(rt)) return CISV_ROWS_MEMORY_LIMIT;
 
         if (write_row(rt, fields, lengths, field_count) != 0) {
@@ -1499,15 +1508,9 @@ static cisv_rows_status_t external_process_candidate_shard(cisv_rows_runtime_t *
             continue;
         }
 
-        if (key_set_lookup(&accepted, key, key_len, hash, NULL)) {
-            rt->stats->duplicate_rows++;
-            continue;
-        }
-
         int inserted = 0;
         int insert_rc = key_set_insert_or_assign(&accepted, key, key_len, hash,
                                                  CISV_KEYSET_EMPTY, &inserted, NULL);
-        (void)inserted;
         if (insert_rc == -2) {
             status = CISV_ROWS_MEMORY_LIMIT;
             break;
@@ -1515,6 +1518,10 @@ static cisv_rows_status_t external_process_candidate_shard(cisv_rows_runtime_t *
         if (insert_rc != 0) {
             status = CISV_ROWS_EXTERNAL_ERROR;
             break;
+        }
+        if (!inserted) {
+            rt->stats->duplicate_rows++;
+            continue;
         }
         bitset_set(accepted_bits, (size_t)seq);
         rt->stats->output_rows++;
