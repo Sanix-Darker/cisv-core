@@ -16,14 +16,16 @@
 #endif
 
 #define CISV_KEYSET_EMPTY SIZE_MAX
+#define CISV_KEYSET_ROW_EMPTY UINT32_MAX
 
 typedef struct {
     uint64_t hash;
     size_t offset;
-    size_t len;
-    size_t row_index;
-    unsigned char used;
+    uint32_t len;
+    uint32_t row_index;
 } cisv_key_entry_t;
+
+_Static_assert(sizeof(cisv_key_entry_t) <= 24, "row key hash entries must stay compact");
 
 typedef struct {
     cisv_key_entry_t *entries;
@@ -169,8 +171,7 @@ static int key_entry_matches(const cisv_key_set_t *set,
                              const char *key,
                              size_t key_len,
                              uint64_t hash) {
-    return entry->used &&
-           entry->hash == hash &&
+    return entry->hash == hash &&
            entry->len == key_len &&
            memcmp(set->arena + entry->offset, key, key_len) == 0;
 }
@@ -186,7 +187,7 @@ static int key_set_find_slot(const cisv_key_set_t *set,
     size_t idx = (size_t)hash & mask;
     for (size_t probe = 0; probe < set->capacity; probe++) {
         cisv_key_entry_t *entry = &set->entries[idx];
-        if (!entry->used) {
+        if (entry->hash == 0) {
             *slot = idx;
             *found = 0;
             return 0;
@@ -220,10 +221,10 @@ static int key_set_rehash(cisv_key_set_t *set, size_t new_capacity) {
     set->memory_used = set->memory_used - old_bytes + bytes;
 
     for (size_t i = 0; i < old_capacity; i++) {
-        if (!old_entries[i].used) continue;
+        if (old_entries[i].hash == 0) continue;
         size_t mask = new_capacity - 1;
         size_t idx = (size_t)old_entries[i].hash & mask;
-        while (new_entries[idx].used) idx = (idx + 1) & mask;
+        while (new_entries[idx].hash != 0) idx = (idx + 1) & mask;
         new_entries[idx] = old_entries[i];
         set->count++;
     }
@@ -273,7 +274,11 @@ static int key_set_lookup(cisv_key_set_t *set,
     int found = 0;
     if (key_set_find_slot(set, key, key_len, hash, &slot, &found) != 0) return 0;
     if (!found) return 0;
-    if (row_index) *row_index = set->entries[slot].row_index;
+    if (row_index) {
+        *row_index = set->entries[slot].row_index == CISV_KEYSET_ROW_EMPTY
+            ? CISV_KEYSET_EMPTY
+            : (size_t)set->entries[slot].row_index;
+    }
     return 1;
 }
 
@@ -289,13 +294,21 @@ static int key_set_insert_or_assign(cisv_key_set_t *set,
 
     int grow_rc = key_set_grow_if_needed(set);
     if (grow_rc != 0) return grow_rc;
+    if (key_len > UINT32_MAX) return -1;
+    if (row_index != CISV_KEYSET_EMPTY && row_index >= CISV_KEYSET_ROW_EMPTY) return -1;
 
     size_t slot = 0;
     int found = 0;
     if (key_set_find_slot(set, key, key_len, hash, &slot, &found) != 0) return -1;
     if (found) {
-        if (old_row_index) *old_row_index = set->entries[slot].row_index;
-        set->entries[slot].row_index = row_index;
+        if (old_row_index) {
+            *old_row_index = set->entries[slot].row_index == CISV_KEYSET_ROW_EMPTY
+                ? CISV_KEYSET_EMPTY
+                : (size_t)set->entries[slot].row_index;
+        }
+        set->entries[slot].row_index = row_index == CISV_KEYSET_EMPTY
+            ? CISV_KEYSET_ROW_EMPTY
+            : (uint32_t)row_index;
         return 0;
     }
 
@@ -305,11 +318,12 @@ static int key_set_insert_or_assign(cisv_key_set_t *set,
     if (key_len > 0) memcpy(set->arena + offset, key, key_len);
     set->arena_len += key_len;
 
-    set->entries[slot].used = 1;
     set->entries[slot].hash = hash;
     set->entries[slot].offset = offset;
-    set->entries[slot].len = key_len;
-    set->entries[slot].row_index = row_index;
+    set->entries[slot].len = (uint32_t)key_len;
+    set->entries[slot].row_index = row_index == CISV_KEYSET_EMPTY
+        ? CISV_KEYSET_ROW_EMPTY
+        : (uint32_t)row_index;
     set->count++;
     if (inserted) *inserted = 1;
     return 0;
