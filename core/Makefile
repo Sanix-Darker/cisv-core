@@ -62,6 +62,7 @@ CFLAGS ?= $(BASE_CFLAGS) $(ARCH_CFLAGS)
 CFLAGS_DEBUG = -Wall -Wextra -g -O0 -fsanitize=address -fsanitize=undefined \
                -fno-omit-frame-pointer -fPIC
 DEBUG_TEST_ENV ?= ASAN_OPTIONS=detect_leaks=0
+CFLAGS_VALGRIND = -Wall -Wextra -g -O1 -fno-omit-frame-pointer -fPIC $(SECURITY_CFLAGS)
 
 VALGRIND ?= valgrind
 VALGRIND_FLAGS ?= --leak-check=full --show-leak-kinds=all --track-origins=yes --errors-for-leak-kinds=definite,possible --error-exitcode=1
@@ -75,8 +76,12 @@ else ifeq ($(UNAME_S),Darwin)
     # macOS: No RELRO equivalent, but use other hardening
     SECURITY_LDFLAGS =
     CFLAGS += -D__APPLE__
+    CFLAGS_VALGRIND += -D__APPLE__
 else
     SECURITY_LDFLAGS =
+endif
+ifeq ($(UNAME_S),Linux)
+    CFLAGS_VALGRIND += -D_GNU_SOURCE
 endif
 
 LTO_CFLAGS =
@@ -105,6 +110,7 @@ BUILD_DIR = build
 SRCS = $(SRC_DIR)/parser.c $(SRC_DIR)/writer.c $(SRC_DIR)/transformer.c $(SRC_DIR)/operations.c
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 OBJS_DEBUG = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.debug.o,$(SRCS))
+OBJS_VALGRIND = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.valgrind.o,$(SRCS))
 
 # Library outputs
 STATIC_LIB = $(BUILD_DIR)/libcisv.a
@@ -146,9 +152,13 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.debug.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_DEBUG) -I$(INC_DIR) -c -o $@ $<
 
+$(BUILD_DIR)/%.valgrind.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_VALGRIND) -I$(INC_DIR) -c -o $@ $<
+
 # Tests
 TEST_SRCS = $(TEST_DIR)/test_core.c
 TEST_BIN = $(BUILD_DIR)/test_core
+VALGRIND_TEST_BIN = $(BUILD_DIR)/test_core_valgrind
 BENCH_SRC = $(TEST_DIR)/bench_core.c
 BENCH_BIN = $(BUILD_DIR)/bench_core
 
@@ -181,6 +191,10 @@ $(BUILD_DIR)/test_core_debug: $(TEST_SRCS) $(OBJS_DEBUG)
 	$(CC) $(CFLAGS_DEBUG) -I$(INC_DIR) -o $@ \
 		$(TEST_SRCS) $(OBJS_DEBUG) -lm -lpthread
 
+$(VALGRIND_TEST_BIN): $(TEST_SRCS) $(OBJS_VALGRIND)
+	$(CC) $(CFLAGS_VALGRIND) -I$(INC_DIR) -o $@ \
+		$(TEST_SRCS) $(OBJS_VALGRIND) -lm -lpthread
+
 test-debug:
 	@echo "Running debug tests..."
 	@$(MAKE) $(BUILD_DIR)/test_core_debug
@@ -210,8 +224,8 @@ clean:
 
 valgrind:
 	@echo "Running core tests under valgrind..."
-	@$(MAKE) $(TEST_BIN)
-	@$(VALGRIND) $(VALGRIND_FLAGS) ./$(TEST_BIN)
+	@$(MAKE) $(VALGRIND_TEST_BIN)
+	@$(VALGRIND) $(VALGRIND_FLAGS) ./$(VALGRIND_TEST_BIN)
 
 safety:
 	@$(MAKE) test-debug
