@@ -2,6 +2,9 @@
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+
+[![DONATE](https://moochy.dev/p/github/Sanix-Darker/cisv-core/button.svg?label=DONATE&size=s&style=compact&theme=dark)](https://moochy.dev/p/github/Sanix-Darker/cisv-core/donate)
+
 Core C library for CISV with SIMD optimizations (AVX-512/AVX2 + scalar fallback).
 
 ## FEATURES
